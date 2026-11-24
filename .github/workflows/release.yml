@@ -1,0 +1,82 @@
+# Builds JoeBro for Linux and Windows when a version tag (vX.Y.Z) is pushed and
+# attaches the artefacts + SHA256SUMS to a DRAFT GitHub release (publish it by hand).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgtk-3-dev libssl-dev libfuse2
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - name: Package (tarball + AppImage)
+        run: |
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGETOOL=$PWD/appimagetool dist/package.sh linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/out/*.tar.gz
+            dist/out/*.AppImage
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - run: cargo test --release --locked --target x86_64-pc-windows-msvc
+      - name: Package (zip + Inno Setup installer)
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force dist/out, "dist/out/stage/JoeBro-$v-windows-x86_64" | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/joebro.exe"
+          Copy-Item $exe "dist/out/stage/JoeBro-$v-windows-x86_64/JoeBro.exe"
+          Copy-Item $exe dist/out/JoeBro.exe
+          "JoeBro $v for Windows`r`n`r`nDouble-click JoeBro.exe. The local backend is built in; it needs Python 3.10+ (winget install Python.Python.3.12).`r`nConnecting to a server needs nothing.`r`n" | Set-Content "dist/out/stage/JoeBro-$v-windows-x86_64/README.txt"
+          Compress-Archive -Path "dist/out/stage/JoeBro-$v-windows-x86_64" -DestinationPath "dist/out/JoeBro-$v-windows-x86_64.zip"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" dist\windows\joebro.iss
+          Remove-Item -Recurse -Force dist/out/stage, dist/out/JoeBro.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/out/*.zip
+            dist/out/*-setup.exe
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+          merge-multiple: true
+      - name: Checksums + draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artefacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft \
+            --title "JoeBro ${{ github.ref_name }}" --generate-notes *

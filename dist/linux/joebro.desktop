@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=JoeBro
+GenericName=AI Workspace
+Comment=Chat, email, calendar, memory, skills and tools for your AI agents
+Exec=joebro
+Icon=joebro
+Terminal=false
+Categories=Utility;Office;Network;
+Keywords=ai;chat;assistant;agents;joebro;
+StartupWMClass=JoeBro

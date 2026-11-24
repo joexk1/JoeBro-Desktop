@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=JoeBro Personal
+GenericName=AI Workspace
+Comment=JoeBro Personal native AI workspace — chat, email, calendar, brain, skills, tools
+Exec=joebro
+Icon=joebro
+Terminal=false
+Categories=X-Forest;
+Keywords=ai;chat;assistant;joebro;
+StartupWMClass=JoeBro

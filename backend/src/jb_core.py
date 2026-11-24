@@ -1,0 +1,2025 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import textwrap
+import threading
+import time
+import email
+import email.header
+import email.policy
+import email.utils
+import imaplib
+import mimetypes
+import smtplib
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+APP_NAME = "JoeBro"
+DEFAULT_PORT = 8765
+BACKEND_VERSION = "1.3.0"     # the wire contract the phone checks via /api/mobile/hello
+# The reserved chat the phone agent lives in. One id, defined here, so a rename
+# never has to chase string literals through the other modules.
+PHONE_SESSION_ID = os.environ.get("JOEBRO_PHONE_SESSION") or "phone"   # an older install can keep its session id
+# Device ids that mean "this backend's own machine" for a chat bound to a device
+# (see the bridge below). '' always does; JOEBRO_HOST_ID adds this host's own name.
+LOCAL_HOST_IDS = {""} | {x.strip() for x in (os.environ.get("JOEBRO_HOST_ID") or "").split(",") if x.strip()}
+
+# Deep-research worker registry. Handler is per-request, so worker bookkeeping
+# lives at module scope: _RESEARCH_STARTED is the set of ids that already have a
+# worker (so a panel reload / re-POST never spawns a second one or re-runs a
+# finished item); _RESEARCH_CANCEL holds ids the worker must stop on.
+_RESEARCH_GUARD = threading.Lock()
+_RESEARCH_STARTED: set = set()
+_RESEARCH_CANCEL: set = set()
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# === JoeBro macOS Use: dependency-free computer use via osascript + screencapture
+# (both ship with macOS) - no external dependencies.
+def _applescript_str(text):
+    """Quote a Python string as an AppleScript string literal."""
+    return '"' + (text or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_MACOS_KEY_CODES = {"return": 36, "enter": 36, "tab": 48, "space": 49, "escape": 53,
+                    "esc": 53, "delete": 51, "backspace": 51, "up": 126, "down": 125,
+                    "left": 123, "right": 124}
+_MACOS_MODS = {"cmd": "command down", "command": "command down", "ctrl": "control down",
+               "control": "control down", "opt": "option down", "option": "option down",
+               "alt": "option down", "shift": "shift down"}
+
+MACOS_USE_TOOL = {"type": "function", "function": {
+    "name": "macos_use",
+    "description": ("Control this Mac (computer use). Call 'snapshot' first and after every action "
+                   "to read the frontmost app's windows, menus, buttons and fields as TEXT - vastly "
+                   "cheaper than a screenshot, which is a last resort. Actions: snapshot, open_app, "
+                   "click (element by name), type, key (e.g. 'cmd+s', 'return'), menu (menu_path "
+                   "'File>Save' or 'File>Export>PDF…'), screenshot."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["snapshot", "open_app", "click", "type", "key", "menu", "screenshot"]},
+        "app": {"type": "string", "description": "app name for open_app"},
+        "element": {"type": "string", "description": "name of the button/element to click"},
+        "text": {"type": "string", "description": "text to type"},
+        "key": {"type": "string", "description": "shortcut to press, e.g. 'cmd+s'"},
+        "menu_path": {"type": "string", "description": "menu path for action 'menu', e.g. 'File>Save'"}},
+        "required": ["action"]}}}
+
+
+ADVISOR_DEFAULT_DESC = (
+    "Ask the user's Advisor — a more powerful model they chose — for a second opinion. "
+    "Call it when you're genuinely stuck, the problem needs deeper reasoning than you can do "
+    "(tricky bugs, maths, architecture, high-stakes decisions), your attempts keep failing, or "
+    "the user asks for a second opinion. Send ONE self-contained question containing ALL the "
+    "context needed (relevant code, errors, constraints) — the advisor cannot see this chat and "
+    "has no tools. Weigh its advice against what you know, then act; you own the final answer.")
+
+
+def advisor_tool_schema(description=""):
+    """The Advisor plugin's tool schema. The description is user-editable (the
+    advisor_description pref) — it is how the user tunes WHEN their everyday
+    model escalates to the stronger one."""
+    return {"type": "function", "function": {
+        "name": "advisor",
+        "description": (description or "").strip() or ADVISOR_DEFAULT_DESC,
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string",
+                         "description": "the complete, self-contained question for the advisor, including all relevant context/code/errors"}},
+            "required": ["question"]}}}
+
+
+def _macos_guard(blocked):
+    """AppleScript prologue: resolve the frontmost app (fa) and refuse to touch
+    it if it matches the user's blocked-apps list (substring, case-insensitive -
+    AppleScript string compares ignore case by default)."""
+    scr = 'set fa to name of first application process whose frontmost is true\n'
+    if blocked:
+        lst = ", ".join(_applescript_str(b) for b in blocked)
+        scr += ('repeat with b in {' + lst + '}\n'
+                'if fa contains b then return "Blocked: " & fa & " is on your blocked apps list."\n'
+                'end repeat\n')
+    return scr
+
+
+def macos_use_argv(action, params, blocked=()):
+    """Build the dependency-free computer-use command (argv) for an action.
+    Returns an argv list, or raises ValueError for a bad/unknown action.
+    Every System Events script starts with _macos_guard so a blocked app can't
+    be clicked, typed into, or read - not just not opened."""
+    action = (action or "").strip().lower()
+    params = params or {}
+    guard = _macos_guard(blocked)
+    if action == "snapshot":
+        # Text accessibility snapshot: one try-wrapped line per element class so
+        # a class an app doesn't expose never kills the rest. Toolbar and sheet
+        # (dialog) buttons are where System Events hides half of every app.
+        classes = [("Buttons", "name of buttons of front window"),
+                   ("Toolbar", "name of buttons of toolbar 1 of front window"),
+                   ("Sheet", "name of UI elements of sheet 1 of front window"),
+                   ("Fields", "name of text fields of front window"),
+                   ("Checkboxes", "name of checkboxes of front window"),
+                   ("Popups", "name of pop up buttons of front window"),
+                   ("Radio", "name of radio buttons of front window"),
+                   ("Links", "name of links of front window"),
+                   ("Tabs", "name of radio buttons of tab group 1 of front window"),
+                   ("Text", "name of static texts of front window")]
+        lines = "".join('try\nset out to out & "%s: " & (%s as string) & linefeed\nend try\n' % c
+                        for c in classes)
+        scr = ('set AppleScript\'s text item delimiters to ", "\n'
+               'tell application "System Events"\n' + guard +
+               'set out to "App: " & fa & linefeed\n'
+               'tell process fa\n'
+               'try\nset out to out & "Windows: " & (name of windows as string) & linefeed\nend try\n'
+               'try\nset out to out & "Menus: " & (name of menu bar items of menu bar 1 as string) & linefeed\nend try\n'
+               + lines +
+               'end tell\nreturn out\nend tell')
+        return ["osascript", "-e", scr]
+    if action == "open_app":
+        app = (params.get("app") or params.get("target") or "").strip()
+        if not app:
+            raise ValueError("open_app needs an 'app' name")
+        low = app.lower()
+        if any(b.lower() in low or low in b.lower() for b in blocked):
+            raise ValueError(app + " is on your blocked apps list.")
+        return ["osascript", "-e", "tell application " + _applescript_str(app) + " to activate"]
+    if action == "type":
+        scr = ('tell application "System Events"\n' + guard +
+               'keystroke ' + _applescript_str(params.get("text") or "") + '\nend tell')
+        return ["osascript", "-e", scr]
+    if action == "key":
+        combo = (params.get("key") or "").strip().lower()
+        parts = [p for p in re.split(r"[+\-\s]+", combo) if p]
+        if not parts:
+            raise ValueError("key needs a shortcut, e.g. 'cmd+s'")
+        keyname = parts[-1]
+        mods = [_MACOS_MODS[p] for p in parts[:-1] if p in _MACOS_MODS]
+        using = (" using {" + ", ".join(mods) + "}") if mods else ""
+        if keyname in _MACOS_KEY_CODES:
+            tail = "key code " + str(_MACOS_KEY_CODES[keyname]) + using
+        else:
+            tail = "keystroke " + _applescript_str(keyname) + using
+        scr = 'tell application "System Events"\n' + guard + tail + '\nend tell'
+        return ["osascript", "-e", scr]
+    if action == "click":
+        el = (params.get("element") or params.get("target") or "").strip()
+        if not el:
+            raise ValueError("click needs an 'element' name")
+        q = _applescript_str(el)
+        # Top-level match first; on failure walk entire contents, because
+        # System Events only sees direct children with a `whose` filter and
+        # most real buttons live nested in groups/toolbars.
+        scr = ('tell application "System Events"\n' + guard +
+               'tell process fa\n'
+               'try\n'
+               'click (first UI element of front window whose name is ' + q + ' or description is ' + q + ')\n'
+               'return "clicked " & ' + q + '\n'
+               'on error\n'
+               'repeat with el in (entire contents of front window)\n'
+               'try\n'
+               'if (name of el is ' + q + ') or (description of el is ' + q + ') then\n'
+               'click el\nreturn "clicked " & ' + q + '\n'
+               'end if\nend try\nend repeat\n'
+               'return "No element " & ' + q + ' & " found - run snapshot to list elements"\n'
+               'end try\n'
+               'end tell\nend tell')
+        return ["osascript", "-e", scr]
+    if action == "menu":
+        path = (params.get("menu_path") or "").strip()
+        items = [p.strip() for p in re.split(r"[>/]", path) if p.strip()]
+        if len(items) < 2:
+            raise ValueError("menu needs a path like 'File>Save'")
+        top = _applescript_str(items[0])
+        target = 'menu ' + top + ' of menu bar item ' + top + ' of menu bar 1'
+        for sub in items[1:-1]:   # submenus, e.g. File>Export>PDF
+            s = _applescript_str(sub)
+            target = 'menu ' + s + ' of menu item ' + s + ' of ' + target
+        scr = ('tell application "System Events"\n' + guard +
+               'tell process fa\n'
+               'click menu item ' + _applescript_str(items[-1]) + ' of ' + target +
+               '\nend tell\nend tell')
+        return ["osascript", "-e", scr]
+    if action == "screenshot":
+        return ["screencapture", "-x", "/tmp/joebro_screenshot_" + str(int(time.time())) + ".png"]
+    raise ValueError("unknown macos_use action: " + action)
+
+
+
+
+def app_support_dir():
+    root = os.environ.get("JOEBRO_DATA_DIR")
+    if root:
+        return Path(root)
+    return Path.home() / "Library" / "Application Support" / APP_NAME
+
+
+_DATA_ROOT = []   # the live Store's root, set by Store.__init__ (last one wins)
+
+
+def data_dir(store=None):
+    """Where every JoeBro-owned file lives: the store's root
+    (~/Library/Application Support/JoeBro). Modules that have no handler to ask
+    call this instead of hardcoding a path; JOEBRO_DATA_DIR overrides it for tests."""
+    if store is not None:
+        return Path(store.root)
+    env = os.environ.get("JOEBRO_DATA_DIR")
+    if env:
+        return Path(env)
+    return Path(_DATA_ROOT[0]) if _DATA_ROOT else app_support_dir()
+
+
+def atomic_write_text(path: Path, text: str):
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def mktemp_beside(path: Path):
+    """(fd, name) for a temp file next to `path`, created the way a plain
+    open() would create it: mode 0666, trimmed by the umask or — where the
+    folder has one — its default ACL.
+
+    Not tempfile.mkstemp: that forces 0600, os.replace carries the 0600 onto
+    the real file, and in a folder with a default ACL (a file-sync server's data
+    folder, say) a 0600 create sets the ACL mask to --- . The sync server then
+    can't read anything the backend wrote, so the file opens in JoeBro and
+    nowhere else."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        tmp = path.parent / f"{path.name}.{os.urandom(6).hex()}.tmp"
+        try:
+            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), str(tmp)
+        except FileExistsError:
+            continue
+
+
+def atomic_write_bytes(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = mktemp_beside(path)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# Per-path write locks. The server is one process with many threads
+# (ThreadingHTTPServer), so a threading.Lock per file path serializes the
+# read-modify-write that edit/update_document do — without it two concurrent
+# agents can both read the original and the second write silently drops the
+# first's edit. (fcntl.flock would be for separate processes; not our case.)
+_PATH_LOCKS: dict = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+# Claude-Code-style command-permission prompts. When "ask before running
+# commands" is on (full mode), the agent loop blocks on one of these events
+# until the app POSTs the user's allow/deny/always decision.
+_PERMISSION_REGISTRY: dict = {}        # request_id -> {"event": Event, "decision": str}
+_PERMISSION_GUARD = threading.Lock()
+_SESSION_ALLOW: dict = {}              # session_id -> set of tools "always allowed this session"
+
+# Cache of the assembled model picker list — each endpoint needs a live network
+# fetch, so we don't redo it on every /api/models call.
+_MODELS_CACHE: dict = {"ts": 0.0, "items": None}
+_MODELS_CACHE_LOCK = threading.Lock()
+_MODELS_TTL = 300                      # seconds
+
+
+def lock_for_path(path) -> threading.Lock:
+    key = str(path)
+    with _PATH_LOCKS_GUARD:
+        lk = _PATH_LOCKS.get(key)
+        if lk is None:
+            lk = _PATH_LOCKS[key] = threading.Lock()
+        return lk
+
+
+def backup_existing(path: Path):
+    """Copy an existing file aside before it's overwritten, so a bad AI edit is
+    recoverable. Best-effort; kept in Application Support (outside the bound
+    folder) so it stays clean and agents can't reach the backups. Last 5/file."""
+    try:
+        if not path.is_file():
+            return
+        bdir = app_support_dir() / "backups"
+        bdir.mkdir(parents=True, exist_ok=True)
+        tag = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        # microseconds so rapid (sub-second) AI edits don't overwrite each other
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+        shutil.copy2(path, bdir / f"{path.name}.{tag}.{stamp}.bak")
+        olds = sorted(bdir.glob(f"{path.name}.{tag}.*.bak"))
+        for old in olds[:-5]:
+            old.unlink()
+    except Exception:
+        pass  # never let a backup failure block the actual write
+
+
+# ---------------------------------------------------------------------------
+# .doc / .docx support for the AI's file tools. Word files are real Word files,
+# never Markdown. The AI reads them as plain text (so it can summarize / answer
+# questions) and edits them in place — find/replace patches the document.xml
+# text nodes so all formatting, colours, and images are preserved. The user's
+# own rich editing happens natively in the Swift app (NSAttributedString).
+# ponytail: stdlib zipfile + ElementTree, no python-docx dependency.
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def is_docx(path) -> bool:
+    return str(path).lower().endswith(".docx")
+
+
+def docx_to_text(path: Path) -> str:
+    """Read Word body text in document order, including tables and controls."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            info=z.getinfo("word/document.xml")
+            if info.file_size > 32 * 1024 * 1024:
+                raise ValueError("DOCX document XML is too large to read")
+            root=ET.fromstring(z.read(info))
+    except (KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        raise ValueError("Cannot read DOCX: damaged, encrypted, or missing Word document XML") from exc
+
+    def paragraph(node):
+        parts=[]
+        def visit(n):
+            if n.tag == _W + "del": return
+            if n.tag in (_W+"t", "{http://schemas.openxmlformats.org/officeDocument/2006/math}t"):
+                parts.append(n.text or "")
+            elif n.tag == _W+"tab": parts.append("\t")
+            elif n.tag in (_W+"br", _W+"cr"): parts.append("\n")
+            elif n.tag in (_W+"footnoteReference", _W+"endnoteReference"):
+                parts.append("[note " + n.get(_W+"id", "") + "]")
+            else:
+                for child in n: visit(child)
+        visit(node)
+        text="".join(parts)
+        if node.find(_W+"pPr/"+_W+"numPr") is not None and text.strip(): text="• " + text
+        return text
+
+    def blocks(node):
+        lines=[]
+        for child in node:
+            if child.tag == _W+"p": lines.append(paragraph(child))
+            elif child.tag == _W+"tbl":
+                for row in child:
+                    if row.tag != _W+"tr": continue
+                    cells=[" / ".join(blocks(cell)) for cell in row if cell.tag == _W+"tc"]
+                    if cells: lines.append("\t".join(cells))
+            elif child.tag not in (_W+"del", _W+"sectPr", _W+"pPr", _W+"tcPr"):
+                lines.extend(blocks(child))
+        return lines
+    body=root.find(_W+"body")
+    text="\n".join(blocks(body) if body is not None else []).strip()
+    return text + "\n" if text else ""
+
+
+def read_doc_context(path: Path) -> str:
+    """Agent read context; keep ancillary Word text separate from the body."""
+    text=read_doc_text(path)
+    if not is_docx(path): return text
+    extras=docx_extras(path)
+    for key,label in (("header","Headers"),("footer","Footers"),("footnotes","Footnotes")):
+        if extras.get(key): text += "\n["+label+"]\n"+extras[key]+"\n"
+    with zipfile.ZipFile(path) as z:
+        for name,tag,label in (("word/endnotes.xml","endnote","Endnotes"),("word/comments.xml","comment","Comments")):
+            if name not in z.namelist(): continue
+            root=ET.fromstring(z.read(name));rows=[]
+            for node in root.iter(_W+tag):
+                ident=node.get(_W+"id", "")
+                if ident.startswith('-') or (tag=='endnote' and ident=='0'):continue
+                body="\n".join("".join(t.text or "" for t in p.iter(_W+"t")) for p in node.iter(_W+"p"))
+                if body.strip():rows.append(ident+": "+body.strip())
+            if rows:text += "\n["+label+"]\n"+"\n".join(rows)+"\n"
+    return text or "[This DOCX has no extractable text. Images/scans need a visual or OCR reader.]"
+
+
+def docx_extras(path: Path) -> dict:
+    """Header / footer / footnote text from a .docx. NSAttributedString only
+    imports the main body, so the editor fetches these separately to show them
+    around the page. Plain text per region (one line per paragraph)."""
+    out = {"header": "", "footer": "", "footnotes": ""}
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+
+            def text_of(name):
+                try:
+                    root = ET.fromstring(z.read(name))
+                except (KeyError, ET.ParseError):
+                    return ""
+                paras = ["".join(t.text or "" for t in p.iter(_W + "t"))
+                         for p in root.iter(_W + "p")]
+                return "\n".join(x for x in paras if x.strip())
+
+            heads = sorted(n for n in names if re.match(r"word/header\d*\.xml$", n))
+            foots = sorted(n for n in names if re.match(r"word/footer\d*\.xml$", n))
+            notes = [n for n in names if n == "word/footnotes.xml"]
+            out["header"] = "\n".join(text_of(n) for n in heads).strip()
+            out["footer"] = "\n".join(text_of(n) for n in foots).strip()
+            if notes:
+                try:
+                    root = ET.fromstring(z.read(notes[0]))
+                    rows = []
+                    for fn in root.iter(_W + "footnote"):
+                        fid = fn.attrib.get(_W + "id") or fn.attrib.get("id") or ""
+                        if fid.startswith("-") or fid == "0":
+                            continue
+                        txt = "\n".join(
+                            "".join(t.text or "" for t in p.iter(_W + "t"))
+                            for p in fn.iter(_W + "p")
+                        ).strip()
+                        if txt:
+                            rows.append(f"{fid}. {txt}")
+                    out["footnotes"] = "\n".join(rows).strip()
+                except (KeyError, ET.ParseError):
+                    out["footnotes"] = ""
+    except (zipfile.BadZipFile, OSError):
+        pass
+    return out
+
+
+def docx_write_extra(path: Path, region: str, text: str):
+    """Write the header or footer text of a .docx (user/agent edits). Rewrites
+    an existing header/footer part, or creates and wires one up if absent.
+    ponytail: sets the text; intricate per-run header formatting isn't kept."""
+    if region == "footnotes":
+        return docx_write_footnotes(path, text)
+    if region not in ("header", "footer"):
+        raise ValueError("region must be 'header', 'footer', or 'footnotes'")
+    tag, ctype = ("hdr", "header") if region == "header" else ("ftr", "footer")
+    paras = "".join(
+        '<w:p><w:r><w:t xml:space="preserve">' + _xml_escape(line) + "</w:t></w:r></w:p>"
+        for line in (text.splitlines() or [""]))
+    part_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:%s xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        % tag + paras + "</w:%s>" % tag)
+
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        contents = {n: z.read(n) for n in names}
+
+    existing = sorted(n for n in names if re.match(r"word/%s\d*\.xml$" % ctype, n))
+    if existing:
+        contents[existing[0]] = part_xml.encode("utf-8")
+    else:
+        # New part: write it, declare its content type, add a relationship, and
+        # reference it from the body's sectPr so Word actually shows it.
+        part_name = "word/%s1.xml" % ctype
+        contents[part_name] = part_xml.encode("utf-8")
+
+        ct = contents["[Content_Types].xml"].decode("utf-8")
+        override = ('<Override PartName="/word/%s1.xml" ContentType='
+                    '"application/vnd.openxmlformats-officedocument.wordprocessingml.%s+xml"/>'
+                    % (ctype, ctype))
+        ct = ct.replace("</Types>", override + "</Types>")
+        contents["[Content_Types].xml"] = ct.encode("utf-8")
+
+        rels_name = "word/_rels/document.xml.rels"
+        rels = contents.get(rels_name, (
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+        )).decode("utf-8")
+        rid = "rId%s" % ctype
+        rel = ('<Relationship Id="%s" Type="http://schemas.openxmlformats.org/'
+               'officeDocument/2006/relationships/%s" Target="%s1.xml"/>'
+               % (rid, ctype, ctype))
+        rels = rels.replace("</Relationships>", rel + "</Relationships>")
+        contents[rels_name] = rels.encode("utf-8")
+
+        doc = contents["word/document.xml"].decode("utf-8")
+        if "xmlns:r=" not in doc:
+            doc = doc.replace(
+                "<w:document ",
+                '<w:document xmlns:r="http://schemas.openxmlformats.org/'
+                'officeDocument/2006/relationships" ', 1)
+        ref = '<w:%sReference w:type="default" r:id="%s"/>' % (ctype, rid)
+        if re.search(r"<w:sectPr[ >]", doc):
+            # Insert the reference right after the opening <w:sectPr ...> tag.
+            doc = re.sub(r"(<w:sectPr\b[^>]*>)", r"\1" + ref, doc, count=1)
+        else:
+            doc = doc.replace("</w:body>", "<w:sectPr>" + ref + "</w:sectPr></w:body>", 1)
+        contents["word/document.xml"] = doc.encode("utf-8")
+        names = list(contents.keys())
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = mktemp_beside(path)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, data in contents.items():
+                z.writestr(n, data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def docx_write_footnotes(path: Path, text: str):
+    """Persist simple numbered footnotes in word/footnotes.xml. Body markers are
+    inserted by the native editor as superscript text; this keeps the note list
+    with the document and lets JoeBro render it in the footnotes band."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    notes = []
+    for idx, line in enumerate(lines, start=1):
+        body = re.sub(r"^\d+\.\s*", "", line).strip()
+        notes.append(
+            '<w:footnote w:id="%d"><w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p></w:footnote>'
+            % (idx, _xml_escape(body))
+        )
+    footnotes_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>'
+        '<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>'
+        + "".join(notes) + "</w:footnotes>"
+    )
+
+    with zipfile.ZipFile(path) as z:
+        contents = {n: z.read(n) for n in z.namelist()}
+
+    contents["word/footnotes.xml"] = footnotes_xml.encode("utf-8")
+
+    ct = contents.get("[Content_Types].xml", b"").decode("utf-8", errors="replace")
+    override = ('<Override PartName="/word/footnotes.xml" ContentType='
+                '"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>')
+    if "/word/footnotes.xml" not in ct:
+        ct = ct.replace("</Types>", override + "</Types>")
+        contents["[Content_Types].xml"] = ct.encode("utf-8")
+
+    rels_name = "word/_rels/document.xml.rels"
+    rels = contents.get(rels_name, (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+    )).decode("utf-8", errors="replace")
+    if "relationships/footnotes" not in rels:
+        used = [int(x) for x in re.findall(r'Id="rId(\d+)"', rels)]
+        rid = "rId%d" % ((max(used) + 1) if used else 2)
+        rel = ('<Relationship Id="%s" Type="http://schemas.openxmlformats.org/'
+               'officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>'
+               % rid)
+        rels = rels.replace("</Relationships>", rel + "</Relationships>")
+        contents[rels_name] = rels.encode("utf-8")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = mktemp_beside(path)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, data in contents.items():
+                z.writestr(n, data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def docx_replace_in_place(path: Path, find: str, replace: str) -> bool:
+    """Find/replace inside a .docx while keeping every other part (styles,
+    colours, images) byte-for-byte. Replaces within the concatenated run text
+    of each paragraph. Returns True if anything changed.
+    ponytail: matches within a single paragraph; cross-paragraph spans aren't
+    handled — fine for the usual phrase/sentence edit."""
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        contents = {n: z.read(n) for n in names}
+    root = ET.fromstring(contents["word/document.xml"])
+    body = root.find(_W + "body")
+    changed = False
+    for p in (list(body) if body is not None else []):
+        if p.tag != _W + "p":
+            continue
+        ts = list(p.iter(_W + "t"))
+        joined = "".join(t.text or "" for t in ts)
+        if find not in joined:
+            continue
+        new = joined.replace(find, replace)
+        # Put all the new text into the first run; blank the rest. Crude but
+        # keeps the paragraph's run formatting from the first run.
+        if ts:
+            ts[0].text = new
+            ts[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            for t in ts[1:]:
+                t.text = ""
+            changed = True
+    if not changed:
+        return False
+    contents["word/document.xml"] = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = mktemp_beside(path)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for n in names:
+                z.writestr(n, contents[n])
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return True
+
+
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def text_to_docx(path: Path, text: str):
+    """Write plain text as a minimal .docx (one paragraph per line). Used when
+    the AI creates a brand-new Word file or fully rewrites one."""
+    paras = "".join(
+        '<w:p><w:r><w:t xml:space="preserve">' + _xml_escape(line) + "</w:t></w:r></w:p>"
+        for line in (text.splitlines() or [""]))
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>" + paras + "</w:body></w:document>")
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        "</Types>")
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        "</Relationships>")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = mktemp_beside(path)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr("word/document.xml", document)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def apply_find_replace(text, find, replace, replace_all=False, occurrence=None, name="the file"):
+    """One precise edit, or a refusal that says how to fix it.
+
+    The old behaviour was `text.replace(find, replace, 1)`: a `find` that
+    appeared three times silently edited the first one, which is how an agent
+    changes the wrong function and reports success. Ambiguity is now an error
+    the model can act on — it says how many matches and on which lines."""
+    if not find:
+        raise ValueError("edit_document needs `find` (or `content` to rewrite the file)")
+    hits = text.count(find)
+    if hits == 0:
+        loose = find.strip()
+        hint = ""
+        if loose and loose != find and loose in text:
+            hint = " — it matches if you trim the surrounding whitespace, so copy the line exactly as read_file returned it"
+        elif " ".join(find.split()) in " ".join(text.split()):
+            hint = " — the text is there but your whitespace/indentation differs; copy it exactly from read_file"
+        raise ValueError(f"`find` does not appear in {name}{hint}. Read the file and copy the exact text.")
+    if hits > 1 and not replace_all and occurrence is None:
+        lines = [i + 1 for i, ln in enumerate(text.splitlines()) if find.split("\n")[0] in ln][:8]
+        raise ValueError(
+            f"`find` matches {hits} places in {name} (around line(s) {', '.join(map(str, lines))}) — "
+            "refusing to guess which. Include more surrounding text to make it unique, or pass "
+            "replace_all: true to change every one.")
+    if replace_all:
+        return text.replace(find, replace), f"replaced {hits} occurrence(s)"
+    n = int(occurrence or 1)
+    if n < 1 or n > hits:
+        raise ValueError(f"occurrence {n} is out of range — there are {hits}")
+    before, after = text.split(find)[:n], text.split(find)[n:]
+    updated = find.join(before) + replace + find.join(after)
+    line = text[:text.find(find) if n == 1 else len(find.join(before))].count("\n") + 1
+    return updated, f"replaced 1 occurrence (line ~{line})"
+
+
+def event_time_out(value, all_day):
+    """An event time as the API should emit it: never ambiguous.
+
+    All-day means a DATE, so it comes back as `YYYY-MM-DD` in the local calendar
+    — a stored `2026-10-01T22:00:00Z` is midnight on the 2nd in Central Europe, and
+    reporting it as the 1st is a day-out-by-one bug. A timed event comes back as
+    ISO-8601 that always carries an offset; a legacy naive string is interpreted
+    as local and stamped, rather than left for the client to guess."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if "T" not in raw:
+        return raw[:10]                       # already a bare date
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    if all_day:
+        return dt.astimezone().strftime("%Y-%m-%d")
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def read_doc_text(path: Path) -> str:
+    """Document text for the AI — plain text for .docx, CSV for .xlsx, raw otherwise."""
+    if is_docx(path):
+        return docx_to_text(path)
+    if str(path).lower().endswith(".xlsx"):
+        from jb_xlsx import xlsx_to_csv
+        return xlsx_to_csv(path.read_bytes())
+    if str(path).lower().endswith(".apkg"):
+        from jb_apkg import apkg_to_text
+        return apkg_to_text(path.read_bytes())
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def write_doc_text(path: Path, text: str):
+    """Persist full content from the AI — .docx, .xlsx (text is CSV), or atomic text write."""
+    if is_docx(path):
+        text_to_docx(path, text)
+    elif str(path).lower().endswith(".xlsx"):
+        from jb_xlsx import csv_to_xlsx
+        atomic_write_bytes(path, csv_to_xlsx(text))
+    elif str(path).lower().endswith(".apkg"):
+        from jb_apkg import text_to_apkg
+        atomic_write_bytes(path, text_to_apkg(text, path.stem))
+    else:
+        atomic_write_text(path, text)
+
+
+# ---------------------------------------------------------------------------
+# The bridge: when a chat is bound to a folder on a *remote* device, the agent's
+# file/bash tools are forwarded to that device's bridge agent (a small HTTP service the
+# user runs on that machine and registers in the `devices` table) instead of
+# executing on the backend host. Empty host (or LOCAL_HOST_IDS) = the backend itself.
+# Bridge API: POST /v1/exec {command,cwd} ; /v1/read_file {path,max_chars} ;
+# /v1/write_file {path,content} — all behind an X-Bridge-Token header.
+
+REMOTE_ROUTED_TOOLS = {
+    "list_files", "read_file", "read_pdf", "create_document",
+    "edit_document", "suggest_document", "bash", "python",
+}
+
+
+def bridge_call(bridge_url: str, token, endpoint: str, payload: dict, timeout: int = 20):
+    """POST to a device bridge endpoint. Returns parsed JSON, or None if the
+    device is unreachable (caller surfaces that as an error).
+
+    ponytail: 20s default so file/list/read loads fail fast when the device is
+    asleep/unreachable — a long timeout here lets one dead bridge call freeze
+    the whole app (URLSession caps at 6 conns/host, so stuck calls starve
+    chat/model loads). Long-running user commands pass timeout= explicitly."""
+    url = bridge_url.rstrip("/") + endpoint
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Bridge-Token"] = token
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return {"error": f"HTTP {e.code}"}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+
+# ---- Cloak Mode ---------------------------------------------------------------
+# Scrub secrets and personal data from anything that leaves this process for a
+# model or search engine — replaced with placeholders BEFORE the request is
+# built, so no endpoint (local ones included) ever sees the real values.
+# Pattern-based: branded key formats, labelled credentials, Luhn-checked card
+# numbers, document-number shapes. Ordinary prose, code and model names pass.
+
+def _luhn_ok(digits):
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        n = int(d)
+        if i % 2 == 1:
+            n = n * 2 - 9 if n > 4 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def _card_repl(m):
+    digits = re.sub(r"[ -]", "", m.group(0))
+    return "[CREDIT CARD NO.]" if 13 <= len(digits) <= 19 and _luhn_ok(digits) else m.group(0)
+
+
+CLOAK_PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+     "[PRIVATE KEY]"),
+    # branded key formats (OpenAI/Anthropic/Stripe sk-, GitHub, Slack, AWS, Google)
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "[API KEY]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[API KEY]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[API KEY]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[API KEY]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[API KEY]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[API KEY]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "[ACCESS TOKEN]"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"), "Bearer [API KEY]"),
+    # labelled credentials — password: hunter2, api_key=…, client_secret: …
+    (re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:pass(?:word|phrase)?|pwd|passwd))[\"']?\s*[:=]\s*(?:\"[^\"\n]{3,}\"|'[^'\n]{3,}'|\S{3,})"),
+     r"\1: [PASSWORD]"),
+    (re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|secret[_ -]?key"
+                r"|client[_ -]?secret|token|secret))[\"']?\s*[:=]\s*(?:\"[^\"\n]{8,}\"|'[^'\n]{8,}'|[A-Za-z0-9._~+/=-]{8,})"),
+     r"\1: [API KEY]"),
+    # identity documents / account numbers
+    (re.compile(r"(?i)\b(passport(?:\s*(?:no\.?|number|#))?)\s*[:=]?\s*([A-Z0-9]{6,10})\b"),
+     r"\1 [PASSPORT NO.]"),
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+    (re.compile(r"\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b"), "[NI NUMBER]"),
+    (re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"), "[IBAN]"),
+    (re.compile(r"\b[A-Z]{2}\d{2}(?: [A-Z0-9]{4}){3,7}(?: [A-Z0-9]{1,4})?\b"), "[IBAN]"),
+    # card numbers — Luhn-gated so ordinary long numbers survive
+    (re.compile(r"\b(?:\d[ -]?){12,18}\d\b"), _card_repl),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[EMAIL]"),
+    (re.compile(r"(?<![\w.])\+\d{1,3}[ .-]?\(?\d{1,4}\)?(?:[ .-]?\d{2,4}){2,4}\b"), "[PHONE NO.]"),
+    (re.compile(r"\b07\d{3}[ -]?\d{6}\b"), "[PHONE NO.]"),
+    (re.compile(r"\(\d{3}\)\s?\d{3}[ .-]\d{4}\b"), "[PHONE NO.]"),
+]
+
+
+def cloak_text(text):
+    """Placeholders in, secrets out. No-op on non-strings."""
+    if not isinstance(text, str) or not text:
+        return text
+    for rx, repl in CLOAK_PATTERNS:
+        text = rx.sub(repl, text)
+    return text
+
+
+def cloak_messages(messages):
+    """Cloak every piece of text in a chat-completions message list: plain
+    content, vision text blocks, tool replies, and tool-call arguments echoed
+    back in history."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = cloak_text(c)
+        elif isinstance(c, list):
+            m["content"] = [dict(b, text=cloak_text(b.get("text")))
+                            if isinstance(b, dict) and b.get("type") == "text" else b
+                            for b in c]
+        if m.get("tool_calls"):
+            fixed = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                fn = dict(tc.get("function") or {})
+                if isinstance(fn.get("arguments"), str):
+                    fn["arguments"] = cloak_text(fn["arguments"])
+                tc["function"] = fn
+                fixed.append(tc)
+            m["tool_calls"] = fixed
+        out.append(m)
+    return out
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp", ".tiff"}
+
+TOOL_BLOCK_RE = re.compile(r"```([A-Za-z_][A-Za-z0-9_]*)\n(.*?)```", re.DOTALL)
+# Models emit tool calls in several XML shapes; normalize_xml_tools rewrites
+# all of them into the fenced form. Direct <create_document><path>..</path>..,
+# <invoke name="tool"><parameter name="k">v</parameter></invoke>, and DSML.
+XML_TOOL_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</\1>", re.DOTALL)
+XML_FIELD_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</\1>", re.DOTALL)
+XML_INVOKE_RE = re.compile(r'<invoke\s+name=["\'](\w+)["\']>\s*(.*?)</invoke>', re.DOTALL | re.IGNORECASE)
+XML_PARAM_RE = re.compile(r'<parameter\s+name=["\'](\w+)["\']>(.*?)</parameter>', re.DOTALL | re.IGNORECASE)
+# Common model aliases -> our tool names (subset of the Pi's _TOOL_NAME_MAP).
+TOOL_ALIASES = {
+    "shell": "bash", "terminal": "bash", "command": "bash", "run": "bash", "execute": "bash",
+    "code": "python", "search": "web_search", "websearch": "web_search",
+    "edit": "edit_document", "create": "create_document", "document": "edit_document",
+    "update_document": "edit_document",
+    "suggest": "suggest_document", "memory": "manage_memory", "tasks": "manage_tasks",
+    "skills": "manage_skills", "skill": "manage_skills", "research": "manage_research",
+}
+OBSOLETE_AI_TOOLS = {
+    "manage_documents",
+    "chat_with_model", "create_session", "list_sessions", "send_to_session", "pipeline",
+    "manage_session", "ask_teacher", "list_models",
+    "download_model", "serve_model", "list_served_models", "stop_served_model",
+    "list_downloads", "cancel_download", "search_hf_models", "list_cached_models",
+    "list_serve_presets", "serve_preset", "adopt_served_model", "list_cookbook_servers",
+    "app_api", "api_call",
+}
+EMAIL_AI_TOOLS = {
+    "list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email",
+    "bulk_email", "delete_email", "archive_email", "mark_email_read", "read_email_attachment", "save_email_attachment",
+}
+TRANSFER_AI_TOOLS = {"export_to_artifact", "deliver_artifact", "move_file"}
+# The phone agent's extra tools. Offered to the phone chat (and the silent runs
+# that belong to it: personal tasks, heartbeat), never to an ordinary Mac chat,
+# so a 1.2.1 user sees no change. Each one degrades to a plain-text "here is how
+# to enable it" result when the thing it needs is not set up.
+PHONE_TOOL_NAMES = {
+    "manage_plan", "remind_me", "manage_reminders", "notify_me", "manage_pulse",
+    "spawn_agent", "spawn_subagent", "manage_agents", "get_location", "get_weather",
+    "push_status", "describe_image", "find_tools", "manage_autonomy",
+    "muse_recall", "muse_remember", "muse_update", "muse_forget",
+    "personal_task_create", "personal_task_list", "personal_task_update",
+    "personal_task_delete", "personal_task_run_now",
+} | TRANSFER_AI_TOOLS
+PRODUCTION_AI_TOOLS = {
+    "bash", "python", "web_search",
+    "list_files", "read_file", "read_pdf", "read_attachment",
+    "create_document", "edit_document", "suggest_document",
+    "trigger_research", "manage_research", "manage_memory", "manage_tasks", "manage_skills",
+    "manage_chats", "create_event", "manage_events",
+    "shopping_list", "health_data", "coding_agents", "proactive_actions", "desktop_use",
+    "recent_coding_sessions", "start_coding_session", "send_to_coding_session",
+} | EMAIL_AI_TOOLS | PHONE_TOOL_NAMES
+WRITE_SIDE_EFFECT_TOOLS = {
+    "bash", "python",
+    "create_document", "edit_document",
+    "manage_memory", "manage_tasks", "manage_skills", "trigger_research", "manage_research",
+    "manage_chats", "create_event", "manage_events", "desktop_use",
+    "send_email", "reply_to_email", "bulk_email", "delete_email", "archive_email", "mark_email_read", "save_email_attachment",
+    "remind_me", "manage_reminders", "notify_me", "manage_pulse", "manage_autonomy",
+    "spawn_agent", "spawn_subagent", "manage_agents", "start_coding_session", "send_to_coding_session",
+    "muse_remember", "muse_update", "muse_forget",
+    "personal_task_create", "personal_task_update", "personal_task_delete", "personal_task_run_now",
+} | TRANSFER_AI_TOOLS
+
+
+def _fn(name, desc, props, required):
+    return {"type": "function", "function": {
+        "name": name, "description": desc,
+        "parameters": {"type": "object", "properties": props, "required": required}}}
+
+# Native function-calling schemas. DeepSeek (and most API models) emit reliable
+# STRUCTURED tool calls when given these, instead of guessing a text format and
+# dumping raw markup / ```markdown blocks into the chat.
+FUNCTION_TOOL_SCHEMAS = [
+    _fn("read_attachment", "Read a document uploaded into this chat by its attachment_id. DOCX includes paragraphs, tables, headers and notes. No folder binding is needed. Use lines to continue a long attachment; never claim the unseen remainder was read.",
+        {"attachment_id": {"type": "string"}, "lines": {"type": "string", "description": "1-based line range, e.g. 100-200 or 201-"}}, ["attachment_id"]),
+    _fn("list_files", "List the files and folders in the bound folder, one level at a time. Pass `path` to look INSIDE a sub-folder (folders are shown with a trailing /). Use before read_file/read_pdf, and drill into sub-folders by listing them with their path.",
+        {"path": {"type": "string", "description": "relative sub-folder to list, e.g. 'assets' or 'assets/PRODUCTIONSCROTS' (omit for the top level)"}}, []),
+    _fn("read_file", "Read a file from the bound folder. Text files come back as text; IMAGE files (png, jpg, gif, webp, heic) are shown to you visually so you can actually look at them. Long files come back one window at a time with a footer saying which lines you got and how to ask for the next — read the part you need rather than the whole file. Read-only, works in the lowest agent permission mode.",
+        {"path": {"type": "string", "description": "relative path inside the bound folder"},
+         "lines": {"type": "string", "description": "only this line window of a text file: '40', '200-400' or '900-' (from 900 to the end). Omit for the start of the file."},
+         "pages": {"type": "string", "description": "if the file is a PDF: only these pages — '7', '3-9' or '12-'"}}, ["path"]),
+    _fn("read_pdf", "Extract text from a PDF in the bound folder. Pass `pages` to read one part of a long PDF at a time — the reply ends with which pages you got, out of how many, and how to ask for the next. Read-only, works in the lowest agent permission mode.",
+        {"path": {"type": "string", "description": "relative PDF path inside the bound folder"},
+         "pages": {"type": "string", "description": "only these pages: '7', '3-9' or '12-' (from 12 to the end). Omit to start at page 1."}}, ["path"]),
+    _fn("create_document", "Create a document in the bound folder. For a long document, write the first part normally, then continue with the same path and append=true; each call is saved and shown in the editor. Works for any editable type, including .docx (Word).",
+        {"path": {"type": "string", "description": "relative path, e.g. notes.md or report.docx"},
+         "content": {"type": "string", "description": "document text for this part"},
+         "append": {"type": "boolean", "description": "true only for later chunks; append this content to the existing document instead of replacing it"}}, ["path", "content"]),
+    _fn("edit_document", "Edit an existing file. EITHER make a small in-place change with exact find/replace (quote the existing text verbatim), OR rewrite the whole file by passing `content` with the COMPLETE new text (use this to append to / change the open document). For a .docx header/footer set region.",
+        {"path": {"type": "string"}, "find": {"type": "string"}, "replace": {"type": "string"},
+         "content": {"type": "string", "description": "the COMPLETE new file content — pass this INSTEAD of find/replace to rewrite the whole file"},
+         "replace_all": {"type": "boolean", "description": "replace every occurrence of `find` instead of refusing when it matches more than once"},
+         "occurrence": {"type": "integer", "description": "which occurrence of `find` to replace (1-based) when it matches more than once"},
+         "region": {"type": "string", "enum": ["body", "header", "footer"], "description": ".docx only: which part to edit (default body)"}}, ["path"]),
+    _fn("suggest_document", "Suggest an edit to a file without applying it.",
+        {"path": {"type": "string"}, "find": {"type": "string"}, "replace": {"type": "string"}, "reason": {"type": "string"}}, ["path", "find", "replace"]),
+    _fn("web_search", "Search the web for quick facts / current info.", {"query": {"type": "string"}}, ["query"]),
+    _fn("trigger_research", "Start a DEEP RESEARCH report on a topic (multi-source, synthesized). Use this — NOT web_search — when the user asks to 'research' / 'do research on' / 'write a report on' something.",
+        {"query": {"type": "string", "description": "the research topic"}}, ["query"]),
+    _fn("manage_research", "List, view, archive or delete deep-research reports.",
+        {"action": {"type": "string", "enum": ["list", "view", "archive", "delete"]}, "id": {"type": "string"}, "query": {"type": "string"}}, ["action"]),
+    _fn("manage_memory", "Long-term memory. add = store ONE self-contained fact (near-duplicates on the same topic merge automatically); search = recall by meaning; edit/delete = maintain. File facts on an existing topic page when one fits.",
+        {"action": {"type": "string", "enum": ["add", "search", "list", "edit", "delete"]},
+         "text": {"type": "string", "description": "the fact (add/edit) or the search query"},
+         "kind": {"type": "string", "enum": ["world", "experience", "opinion"],
+                  "description": "world = lasting fact; experience = what happened / project state; opinion = the user's judgement or preference"},
+         "topic": {"type": "string", "description": "short-kebab-slug page this fact lives on"},
+         "entities": {"type": "string", "description": "comma-separated named people/places/projects/tools"},
+         "memory_id": {"type": "string"}}, ["action"]),
+    _fn("manage_tasks", "Create/list/edit/delete the user's scheduled tasks. Tasks run as a background agent on their schedule.",
+        {"action": {"type": "string", "enum": ["add", "list", "edit", "delete"]}, "title": {"type": "string"}, "prompt": {"type": "string"},
+         "schedule": {"type": "string", "enum": ["daily", "weekly", "monthly"]}, "time": {"type": "string", "description": "HH:MM 24h"},
+         "weekday": {"type": "integer", "description": "for weekly tasks, which day it fires: 0=Mon, 1=Tue … 6=Sun"},
+         "id": {"type": "string"}}, ["action"]),
+    _fn("manage_skills", "Create/list/edit/delete reusable skills. When adding, write a DETAILED skill, not a one-liner: a clear description, a when_to_use trigger, and a step-by-step procedure.",
+        {"action": {"type": "string", "enum": ["add", "list", "edit", "delete"]}, "name": {"type": "string"},
+         "description": {"type": "string", "description": "one-line summary of what the skill does"},
+         "when_to_use": {"type": "string", "description": "the trigger — what kind of request should invoke this skill"},
+         "content": {"type": "string", "description": "the procedure: concrete markdown/numbered steps to follow"},
+         "status": {"type": "string", "enum": ["active", "draft", "disabled"]}, "id": {"type": "string"}}, ["action"]),
+    _fn("list_email_accounts", "List the user's connected email accounts.", {}, []),
+    _fn("list_emails", "List recent emails. Use this to read/pull/summarize the inbox — NEVER use bash/curl for email.",
+        {"folder": {"type": "string"}, "limit": {"type": "integer"}, "query": {"type": "string"}}, []),
+    _fn("read_email", "Read the full body of one email by uid.",
+        {"uid": {"type": "string"}, "folder": {"type": "string"}}, ["uid"]),
+    _fn("read_email_attachment", "Read-only. List a message's attachments (filename, mime type, size), or read one attachment's content as text. Call with just `uid` to list; add `index` (or `filename`) from that list to extract text. Works for PDF, docx, xlsx (as CSV), and text/csv/markdown/json/html; other formats (images, archives, binaries) return extracted=false with a note. Long text is capped: use `offset` (or `pages` for PDFs) to continue. Does not mark the email read.",
+        {"uid": {"type": "string", "description": "email uid from list_emails/read_email"}, "folder": {"type": "string"},
+         "index": {"type": "integer", "description": "attachment index from the listing"},
+         "filename": {"type": "string", "description": "alternative to index"},
+         "pages": {"type": "string", "description": "PDF only: '3', '3-9', '12-'"},
+         "offset": {"type": "integer", "description": "character offset to continue a truncated read"}}, ["uid"]),
+    _fn("save_email_attachment", "Save the original bytes of an email attachment into the shared JoeBro artifact store. Use the MIME index from read_email/read_email_attachment. Returns artifact_id and file metadata for folder export or image/playlist-cover tools; never sends binary data to the model. Does not mark the email read or remove it.",
+        {"uid": {"type": "string"}, "index": {"type": "integer", "minimum": 0}, "folder": {"type": "string"}}, ["uid", "index"]),
+    _fn("send_email", "Send an email.",
+        {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, ["to", "subject", "body"]),
+    _fn("archive_email", "Archive an email by uid.", {"uid": {"type": "string"}, "folder": {"type": "string"}}, ["uid"]),
+    _fn("delete_email", "Delete an email by uid.", {"uid": {"type": "string"}, "folder": {"type": "string"}}, ["uid"]),
+    _fn("mark_email_read", "Mark an email read/unread.", {"uid": {"type": "string"}, "read": {"type": "boolean"}}, ["uid"]),
+    _fn("create_event", "Add an event to the user's calendar. YOU resolve the natural-language date/time into ISO-8601 datetimes using today's date given in the system prompt (e.g. 'wednesday 2-5pm' -> the next Wednesday's date with start 14:00 and end 17:00). EVERY timed event MUST carry an explicit IANA `timezone`; the calendar is written in that zone no matter where the user's devices are. For TRAVEL (flights, trains, ferries) `timezone` is the zone of the DEPARTURE location and `start` is the departure wall-clock time there; give the ARRIVAL clock time in `end` with `end_timezone` set to the arrival location's zone (e.g. depart AMS 10:20 Europe/Amsterdam, arrive LGW 10:40 Europe/London). Never convert times to the user's current zone yourself.",
+        {"summary": {"type": "string", "description": "the event title"},
+         "start": {"type": "string", "description": "ISO-8601 start datetime, e.g. 2026-06-17T14:00:00"},
+         "end": {"type": "string", "description": "ISO-8601 end datetime, e.g. 2026-06-17T17:00:00 (wall clock in end_timezone, or timezone if that is omitted)"},
+         "timezone": {"type": "string", "description": "REQUIRED IANA zone id of the event's start (for travel: the DEPARTURE location), e.g. Europe/Amsterdam, Europe/London, America/New_York. Not an abbreviation or offset."},
+         "end_timezone": {"type": "string", "description": "IANA zone id of the end time when it differs from start (travel: the ARRIVAL location's zone). Optional."},
+         "location": {"type": "string", "description": "optional"}, "description": {"type": "string", "description": "optional"},
+         "all_day": {"type": "boolean", "description": "true for an all-day event (optional)"}}, ["summary", "start", "end", "timezone"]),
+    _fn("manage_events", "List, MOVE, edit or delete events ALREADY on the user's calendar — including in bulk. Always `list` first to see what a filter matches, then act on the same filter. Select events with `ids`, a `query` substring of the title, and/or a `from`/`to` date range (all filters combine); `all: true` is required to mean every event. action=shift moves every matched event by an offset (days/hours/minutes, negative moves earlier) — this is how you fix a batch of events that are at the wrong time. action=set changes fields; absolute start/end are only allowed when exactly one event matches.",
+        {"action": {"type": "string", "enum": ["list", "shift", "set", "delete"], "description": "default list"},
+         "ids": {"type": "string", "description": "comma-separated event uids from a previous list"},
+         "query": {"type": "string", "description": "case-insensitive substring of the event title"},
+         "from": {"type": "string", "description": "only events starting on/after this date, YYYY-MM-DD"},
+         "to": {"type": "string", "description": "only events starting on/before this date, YYYY-MM-DD"},
+         "all": {"type": "boolean", "description": "match EVERY event — required when no other filter is given"},
+         "timezone": {"type": "string", "description": "set with absolute start/end: IANA zone id the new time is expressed in (travel: the departure location's zone). Required if start/end have no UTC offset."},
+         "days": {"type": "integer", "description": "shift: whole days to move by (negative = earlier)"},
+         "hours": {"type": "integer", "description": "shift: hours to move by (negative = earlier)"},
+         "minutes": {"type": "integer", "description": "shift: minutes to move by (negative = earlier)"},
+         "summary": {"type": "string", "description": "set: new title"},
+         "start": {"type": "string", "description": "set: ISO-8601 start, single matched event only"},
+         "end": {"type": "string", "description": "set: ISO-8601 end, single matched event only"},
+         "location": {"type": "string", "description": "set: new location"},
+         "description": {"type": "string", "description": "set: new notes"},
+         "all_day": {"type": "boolean", "description": "set: make the event all-day (or not)"}}, ["action"]),
+    _fn("manage_chats", "Find chats and connected folders: list (folder=group name/path, folder=? lists folders; query=name; limit/offset), search, read history. folder scopes chat lookup. list_files/read_file read a path inside the target chat connected folder, without writes or another model. create/bind_folder/set_mode/set_permission/set_model/models/send manage or delegate. Identify chat by id or name; use list to resolve ambiguity.",
+        {"action": {"type": "string", "enum": ["list", "search", "read", "list_files", "read_file", "create", "bind_folder", "set_mode", "set_permission", "set_model", "models", "send"]},
+         "chat": {"type": "string", "description": "target chat id or name (read/send/set_mode/set_permission/set_model/bind_folder)"},
+         "query": {"type": "string", "description": "text to search for across chats (search)"},
+         "message": {"type": "string", "description": "message to post into the chat (send)"},
+         "mode": {"type": "string", "enum": ["chat", "agent"], "description": "new mode (set_mode); also the starting mode for create"},
+         "permission": {"type": "string", "enum": ["sandbox", "readonly", "full"], "description": "file-access level (set_permission); also for create"},
+         "model": {"type": "string", "description": "model name to switch the chat to (set_model) — use the `models` action first to see valid names"},
+         "folder": {"type": "string", "description": "folder group name or bound path to scope list/search/chat lookup; absolute path for bind/create"},
+         "name": {"type": "string", "description": "name for the new chat (create)"},
+         "limit": {"type": "integer"}, "offset": {"type": "integer"}, "path": {"type": "string", "description": "relative path for list_files/read_file"}, "lines": {"type": "string", "description": "read_file line range"}}, ["action"]),
+    _fn("bash", "Run a shell command (only with terminal access + Full Access). NOT for email or web.", {"command": {"type": "string"}}, ["command"]),
+    _fn("python", "Run a Python snippet (only with terminal access + Full Access).", {"code": {"type": "string"}}, ["code"]),
+]
+
+# Personal-agent tools that live in their own modules (shopping list, Apple
+# Health, proactive actions, coding agents). Deferred like the rest (DEFERRED_GROUPS).
+from jb_proactive import SHOPPING_TOOL as _SHOP, HEALTH_TOOL as _HEALTH, PROACTIVE_TOOL as _PROACTIVE  # noqa: E402
+from jb_coding import CODING_AGENTS_TOOL as _CODING  # noqa: E402
+from jb_nightshift import RECENT_SESSIONS_TOOL as _RECENT, START_SESSION_TOOL as _START, SEND_SESSION_TOOL as _SEND  # noqa: E402
+FUNCTION_TOOL_SCHEMAS += [_SHOP, _HEALTH, _PROACTIVE, _CODING, _RECENT, _START, _SEND]
+
+# The phone agent's tools (see PHONE_TOOL_NAMES). Kept out of FUNCTION_TOOL_SCHEMAS
+# so tools_for() only offers them where they belong.
+_ARTIFACT_OPTS = {"filename": {"type": "string", "description": "optional destination file name"},
+                  "subject": {"type": "string", "description": "email subject"},
+                  "body": {"type": "string", "description": "email body text"},
+                  "caption": {"type": "string", "description": "caption for messaging destinations an extension adds"},
+                  "confirm_token": {"type": "string", "description": "from the needs_confirmation preview, only after the user agreed"}}
+_SCHED = {"type": "string", "enum": ["once", "daily", "weekly", "monthly"]}
+_PTASK_FIELDS = {"title": {"type": "string"},
+                 "prompt": {"type": "string", "description": "what the background agent should check/do; its final reply is the notification"},
+                 "schedule": _SCHED,
+                 "time": {"type": "string", "description": "HH:MM local"},
+                 "date": {"type": "string", "description": "YYYY-MM-DD local date, required for schedule=once"},
+                 "weekday": {"type": "integer", "description": "weekly only: 0=Mon ... 6=Sun"},
+                 "enabled": {"type": "boolean"}}
+PHONE_TOOL_SCHEMAS = [
+    _fn("manage_plan", "The working plan for this job: your own to-do list, handed back to you every round so a long task survives compaction and model switches. Use it whenever the work is more than a couple of steps: `set` the steps first, then `done` each one AS you finish it. The user sees it too.",
+        {"action": {"type": "string", "enum": ["get", "set", "add", "done", "doing", "blocked", "clear"], "description": "default get"},
+         "steps": {"type": "string", "description": "set: the steps, one per line"},
+         "text": {"type": "string", "description": "add: the new step; done/doing/blocked: which step (text match)"},
+         "step": {"type": "string", "description": "done/doing/blocked: the step NUMBER from a previous get (or omit on `done` for the next unfinished one)"}}, ["action"]),
+    _fn("remind_me", "Set a ONE-OFF reminder that notifies the user's phone at a specific time (push when it is set up, Telegram as the fallback, the Inbox always). For 'remind me at 6 to call the bank', 'nudge me in 20 minutes'. Resolve the user's words into an absolute ISO-8601 datetime yourself. For anything RECURRING use manage_tasks or personal_task_create instead.",
+        {"text": {"type": "string", "description": "what to remind them of, in their words ('call the bank')"},
+         "at": {"type": "string", "description": "absolute ISO-8601 datetime, e.g. 2026-09-29T18:00:00"},
+         "in_minutes": {"type": "integer", "description": "alternative to `at`: fire this many minutes from now"}}, ["text"]),
+    _fn("manage_reminders", "List or cancel the user's pending one-off reminders.",
+        {"action": {"type": "string", "enum": ["list", "cancel"], "description": "default list"},
+         "id": {"type": "string"}, "text": {"type": "string", "description": "cancel by matching text instead of id"}}, ["action"]),
+    _fn("get_location", "The user's last reported phone location (place name, lat/lon, how old the fix is). Latest fix only. Needs location sharing turned on in the Mac app.", {}, []),
+    _fn("get_weather", "Weather from Open-Meteo: current conditions plus hourly and/or daily forecast. Defaults to the user's current location; pass `place` for anywhere else. Needs location sharing turned on in the Mac app.",
+        {"place": {"type": "string", "description": "optional city/place name; omit for current location"},
+         "hours": {"type": "integer", "description": "hourly forecast length, default 6, max 48"},
+         "days": {"type": "integer", "description": "daily forecast length, 0-7, default 0"}}, []),
+    _fn("push_status", "Check mobile push configuration and registered device counts without sending anything. Reports setup blockers; never exposes device tokens.", {}, []),
+    _fn("manage_autonomy", "Configure or run the user's autonomous routines: small scheduled checks that run on their own with no model call and file a short report in the Inbox. `list` shows which routines exist on this install and their settings. Notifications default off; use notify=true only when requested.",
+        {"action": {"type": "string", "enum": ["list", "set", "enable", "pause", "run"]},
+         "routine": {"type": "string", "description": "routine id from `list`"},
+         "settings": {"type": "object", "properties": {
+             "enabled": {"type": "boolean"}, "notify": {"type": "boolean"},
+             "every_days": {"type": "integer", "minimum": 1, "maximum": 30},
+             "at": {"type": "string"}, "timezone": {"type": "string"}, "quiet_hours": {"type": "string"},
+             "topics": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+             "channel_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}}}, ["action"]),
+    _fn("notify_me", "Send the user a requested phone notification now. auto uses push when configured, otherwise Telegram. mobile requires push; inbox only saves a message. Check the delivery result: APNs acceptance does not guarantee display on the device.",
+        {"message": {"type": "string", "description": "the message, written to be read on a phone"},
+         "title": {"type": "string", "description": "optional short heading"},
+         "channel": {"type": "string", "enum": ["auto", "mobile", "telegram", "inbox"]}}, ["message"]),
+    _fn("manage_pulse", "The user's proactive background check: it runs on its own every so often, works through a plain-English checklist, and messages them only if something needs them. `set` with `add` is how a standing instruction ('tell me if an email from the bank arrives') gets added.",
+        {"action": {"type": "string", "enum": ["get", "set", "run", "pause", "resume"], "description": "default get"},
+         "add": {"type": "string", "description": "set: append one new standing instruction to the checklist"},
+         "checklist": {"type": "string", "description": "set: replace the whole checklist (markdown bullets)"},
+         "interval_minutes": {"type": "integer", "description": "set: how often it runs (minimum 5)"},
+         "quiet_hours": {"type": "string", "description": "set: e.g. '23:00-07:30', it stays silent in this window"}}, ["action"]),
+    _fn("spawn_agent", "Run work in the BACKGROUND as a separate agent with its own session, and carry on. Use it for something genuinely separable and slow. Each agent reports back to the user on its own when it finishes. Costs a full agent run each, so don't spawn where one tool call would do.",
+        {"prompt": {"type": "string", "description": "the complete task, written so it can run without you"},
+         "title": {"type": "string", "description": "short label shown to the user"},
+         "folder": {"type": "string", "description": "absolute path to bind the agent to, if it needs files"},
+         "permission_mode": {"type": "string", "enum": ["readonly", "sandbox", "full"], "description": "default sandbox"}}, ["prompt"]),
+    _fn("spawn_subagent", "Dispatch a SUBAGENT: a worker with its own session that runs one self-contained task independently while you carry on, then reports its result back. Subagents cannot spawn further subagents, and only a few can run at once (you get an error when the limit is hit). Use for separable work (research a topic, review a file, draft something); not for what one tool call does. Check on it with manage_agents.",
+        {"prompt": {"type": "string", "description": "the complete task, written so it can run without you"},
+         "title": {"type": "string", "description": "short label shown to the user"},
+         "model": {"type": "string", "description": "model id to use for this subagent"},
+         "folder": {"type": "string", "description": "absolute path to bind the subagent to, if it needs files"},
+         "permission_mode": {"type": "string", "enum": ["readonly", "sandbox", "full"], "description": "default sandbox"}}, ["prompt"]),
+    _fn("manage_agents", "Check on background agents: list them, get one's full result, or stop one.",
+        {"action": {"type": "string", "enum": ["list", "status", "result", "stop", "clear"], "description": "default list"},
+         "id": {"type": "string"}}, ["action"]),
+    _fn("describe_image", "Look at an image and get a text description including any visible text. Read-only. Give artifact_id (from export_to_artifact), a url, or an artifact-folder path. Needs an image caption model chosen in the Mac app (Settings > Mobile).",
+        {"artifact_id": {"type": "string"}, "path": {"type": "string"}, "url": {"type": "string"},
+         "source": {"type": "string", "description": "transfer URI, e.g. upload:up_<id>"}}, []),
+    _fn("find_tools", "Find and enable a built-in capability or a connected integration you need but don't currently have listed. Call this the moment a job needs something you can't see; do not assume you lack it.",
+        {"query": {"type": "string", "description": "the capability you need, e.g. 'create a github issue'"}}, ["query"]),
+    _fn("muse_recall", "Look up the user's saved personal memory (markdown files: preferences, people, projects, routines). Pass keywords; returns the matching dated lines. Use before saying you don't know something about the user.",
+        {"query": {"type": "string", "description": "keywords; empty with `file` lists that whole file with line numbers"},
+         "file": {"type": "string", "description": "optional: search one file only"},
+         "projects": {"type": "boolean", "description": "also search the user's coding-project and global memory (only when they ask what they know or decided in a project)"}}, []),
+    _fn("muse_remember", "Save ONE durable fact about the user (a preference, person, project, routine) as a short line in a memory file. Not one-off chatter, not secrets. Near-duplicates are skipped.",
+        {"file": {"type": "string", "description": "one of: about-me, preferences, people, projects, routines (or an existing file name)"},
+         "fact": {"type": "string", "description": "one short self-contained line"}}, ["file", "fact"]),
+    _fn("muse_update", "Correct or replace ONE existing personal memory. Recall first, then pass the file, an exact matching phrase or line number, and the replacement fact. Use for changed preferences, updated plans and corrections, rather than appending a contradiction.",
+        {"file": {"type": "string"}, "match": {"type": "string"}, "fact": {"type": "string"}}, ["file", "match", "fact"]),
+    _fn("muse_forget", "DELETE saved memory. Use whenever the user says forget/delete/remove/clear. `match` = a few words of the line (fuzzy), a line number from muse_recall (\"3\", \"2-4\"), or \"*\" to clear a whole file (never about-me). Omit `file` to search every file by words. Returns the exact lines removed; report them.",
+        {"file": {"type": "string", "description": "memory file; optional when matching by words"},
+         "match": {"type": "string", "description": "words, line number(s), or * for the whole file"}}, ["match"]),
+    _fn("personal_task_create", "Create a background task for the phone agent (runs silently on a schedule; notifies you in this chat and by push only when there is something new).",
+        _PTASK_FIELDS, ["title", "prompt", "time"]),
+    _fn("personal_task_list", "List the phone agent's background tasks with schedule, enabled state and last run.", {}, []),
+    _fn("personal_task_update", "Edit a phone-agent task by id (title, prompt, schedule, time, weekday, enabled).",
+        dict({"id": {"type": "string"}}, **_PTASK_FIELDS), ["id"]),
+    _fn("personal_task_delete", "Delete a phone-agent task by id.", {"id": {"type": "string"}}, ["id"]),
+    _fn("personal_task_run_now", "Run a phone-agent task now in the background (returns immediately; a notice arrives only if the result is new).",
+        {"id": {"type": "string"}}, ["id"]),
+    _fn("export_to_artifact", "Fetch a file from a source into the artifact store and return its artifact_id. Sources: url:https://..., upload:up_<id> (a file attached in chat), doc:doc_<id>[?format=pdf], device:/abs/path (this Mac, Full Access only), <folder>:/rel/path (a folder from artifact_roots: documents, downloads), artifact:<id>. 50 MiB max.",
+        {"source": {"type": "string"}, "filename": {"type": "string"}}, ["source"]),
+    _fn("deliver_artifact", "Deliver a stored artifact to a destination. Destinations: <folder>:/dir/ or <folder>:/dir/name.ext (documents, downloads; never overwrites), email:<address>, doc:new/<title>, device:/abs/path (this Mac, Full Access only). Email NEVER sends on the first call: it returns a preview and confirm_token; show the user and call again with the token only after they agree.",
+        dict({"artifact_id": {"type": "string"}, "to": {"type": "string"}}, **_ARTIFACT_OPTS), ["artifact_id", "to"]),
+    _fn("move_file", "Shortcut for export_to_artifact + deliver_artifact in one call, e.g. source=upload:up_<id> to=documents:/Photos/. Same confirmation rule for outbound email: the preview returns an artifact_id, then use deliver_artifact with it and the confirm_token.",
+        dict({"source": {"type": "string", "description": "the source URI (also accepted as `from`)"}, "to": {"type": "string"}}, **_ARTIFACT_OPTS), ["source", "to"]),
+]
+
+# Every reserved/built-in function name. A user's custom API tool is sanitized to
+# a safe snake_case name and prefixed if it would collide with any of these, so a
+# custom tool can never shadow a built-in one in the dispatch loop.
+BUILTIN_TOOL_NAMES = (
+    {t["function"]["name"] for t in FUNCTION_TOOL_SCHEMAS}
+    | {t["function"]["name"] for t in PHONE_TOOL_SCHEMAS}
+    | PRODUCTION_AI_TOOLS | OBSOLETE_AI_TOOLS | EMAIL_AI_TOOLS | {"write_file"}
+)
+
+
+def sanitize_tool_name(name, taken=None):
+    """Turn a user-supplied tool name into a safe function name: lowercase
+    snake_case of alnum+underscore, never empty, never colliding with a built-in
+    or an already-taken custom name (prefixed/suffixed if it would)."""
+    base = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+    if not base:
+        base = "custom_tool"
+    if base[0].isdigit():
+        base = "t_" + base
+    reserved = set(BUILTIN_TOOL_NAMES) | set(taken or set())
+    candidate = base
+    if candidate in reserved:
+        candidate = "custom_" + base
+    n = 2
+    while candidate in reserved:
+        candidate = f"custom_{base}_{n}"
+        n += 1
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) — stdio transport. The user registers MCP servers
+# (Tier 2 / "Advanced": any server you can launch with a command + args). When a
+# server is enabled JoeBro spawns it, performs the MCP handshake over stdin/stdout
+# (newline-delimited JSON-RPC 2.0), discovers its tools (tools/list), and offers
+# them to the model in Agent mode. Calling a tool spawns the server again, does
+# initialize -> tools/call, reads the result, then terminates the process.
+#
+# ROBUSTNESS is the whole point of this module: it runs inside a threaded HTTP
+# server, so a hung subprocess would block a request thread forever. Therefore
+# EVERY interaction is STATELESS (spawn -> use -> kill; no long-lived processes)
+# and HARD-BOUNDED by a wall-clock timeout, after which the process is killed and
+# reaped. Nothing in here ever raises out to the agent loop / tools_for; failures
+# come back as a structured error so a broken server can only ever skip itself.
+
+# Where to look for an MCP launch command when the app's PATH is thin (the
+# sandboxed app may not include Homebrew). Mirrors JoeBroApp.swift pythonURL().
+MCP_PATH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+                 "/opt/homebrew/sbin", "/usr/sbin"]
+MCP_CONNECT_TIMEOUT = 15        # initialize + tools/list
+MCP_CALL_TIMEOUT = 30           # initialize + tools/call
+
+
+def mcp_resolve_command(command):
+    """Resolve an MCP launch command to an absolute path. Checks common install
+    dirs first (the app PATH may lack /opt/homebrew/bin), then shutil.which, then
+    the literal string (which Popen will resolve if it's already absolute)."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return None
+    if os.path.isabs(cmd):
+        return cmd if os.path.exists(cmd) else None
+    for d in MCP_PATH_DIRS:
+        cand = os.path.join(d, cmd)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    found = shutil.which(cmd)
+    if found:
+        return found
+    found = shutil.which(cmd, path=os.pathsep.join(MCP_PATH_DIRS))
+    if found:
+        return found
+    return None
+
+
+def mcp_env():
+    """Subprocess env with an augmented PATH so node/npx/uvx resolve their own
+    helpers even when the parent process PATH is thin."""
+    env = dict(os.environ)
+    extra = os.pathsep.join(MCP_PATH_DIRS)
+    env["PATH"] = (env.get("PATH", "") + os.pathsep + extra).strip(os.pathsep)
+    return env
+
+
+def mcp_split_args(args):
+    """Args may arrive as a list (JSON) or a single shell-style string."""
+    if isinstance(args, list):
+        return [str(a) for a in args]
+    s = (args or "").strip()
+    if not s:
+        return []
+    try:
+        return shlex.split(s)
+    except ValueError:
+        return s.split()
+
+
+class _MCPError(Exception):
+    pass
+
+
+def _mcp_kill(proc):
+    """Terminate then hard-kill an MCP subprocess and reap it. Best-effort and
+    never raises — used on every exit path so we never leak a process."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if stream:
+                stream.close()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def _mcp_session(command, args, want_call, deadline):
+    """Spawn the server, do the MCP handshake, then either tools/list (want_call
+    is None) or tools/call(want_call=(name, arguments)). Returns the parsed JSON
+    result dict. Raises _MCPError on any failure. The process is always killed
+    and reaped before returning. `deadline` is an absolute time.monotonic()."""
+    resolved = mcp_resolve_command(command)
+    if not resolved:
+        raise _MCPError(f"command not found: {command!r} (checked {', '.join(MCP_PATH_DIRS)} and PATH)")
+    argv = [resolved] + mcp_split_args(args)
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=mcp_env(), text=True, bufsize=1,
+            cwd=str(Path.home()))
+    except Exception as exc:
+        raise _MCPError(f"could not launch {command!r}: {exc}")
+
+    # A background reader thread drains stdout into a queue so every read is
+    # bounded by the deadline — a server that hangs without replying can never
+    # block the request thread.
+    import queue as _queue
+    q: "_queue.Queue" = _queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)   # EOF sentinel
+
+    rt = threading.Thread(target=_reader, daemon=True)
+    rt.start()
+
+    def _send(obj):
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        except Exception as exc:
+            raise _MCPError(f"server closed its input: {exc}")
+
+    def _read_result(expect_id):
+        """Read newline JSON until the response with id==expect_id arrives,
+        skipping notifications/other messages. Bounded by the deadline."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _MCPError("timed out waiting for server response")
+            try:
+                line = q.get(timeout=remaining)
+            except _queue.Empty:
+                raise _MCPError("timed out waiting for server response")
+            if line is None:
+                err = ""
+                try:
+                    err = (proc.stderr.read() or "").strip()[:500]
+                except Exception:
+                    pass
+                raise _MCPError("server exited before responding" + (f": {err}" if err else ""))
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue   # non-JSON log line on stdout — ignore
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("id") == expect_id:
+                if "error" in msg and msg["error"]:
+                    e = msg["error"]
+                    raise _MCPError(str(e.get("message") or e) if isinstance(e, dict) else str(e))
+                return msg.get("result") or {}
+
+    try:
+        _send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "JoeBro", "version": "1.0"}}})
+        _read_result(1)
+        _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        if want_call is None:
+            return _read_result_for_list(_send, _read_result)
+        tool_name, arguments = want_call
+        _send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": tool_name, "arguments": arguments or {}}})
+        return _read_result(3)
+    finally:
+        _mcp_kill(proc)
+
+
+def _read_result_for_list(_send, _read_result):
+    _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    return _read_result(2)
+
+
+def mcp_discover(command, args, timeout=MCP_CONNECT_TIMEOUT):
+    """Connect to an MCP server and return its tool list as
+    [{"name","description","inputSchema"}]. Raises _MCPError on failure."""
+    deadline = time.monotonic() + max(1, timeout)
+    result = _mcp_session(command, args, None, deadline)
+    tools = result.get("tools") or []
+    out = []
+    for t in tools:
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        out.append({
+            "name": str(t.get("name")),
+            "description": str(t.get("description") or ""),
+            "inputSchema": t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {"type": "object", "properties": {}},
+            "annotations": t.get("annotations") if isinstance(t.get("annotations"), dict) else {},
+        })
+    return out
+
+
+def mcp_call_tool(command, args, tool_name, arguments, timeout=MCP_CALL_TIMEOUT):
+    """Spawn the server, call one tool, return its text output. Raises _MCPError
+    on failure. Concatenates text content blocks; flags isError as an error."""
+    deadline = time.monotonic() + max(1, timeout)
+    result = _mcp_session(command, args, (tool_name, arguments), deadline)
+    blocks = result.get("content") or []
+    parts = []
+    for b in blocks:
+        if isinstance(b, dict):
+            if b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+            elif b.get("text"):
+                parts.append(str(b.get("text")))
+    text = "\n".join(parts).strip()
+    if not text and not blocks:
+        text = json.dumps(result, ensure_ascii=False)[:4000]
+    is_error = bool(result.get("isError"))
+    return text, is_error
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            self.close()
+
+
+class Store:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        _DATA_ROOT[:] = [root]
+        (self.root / "uploads").mkdir(exist_ok=True)
+        (self.root / "previews").mkdir(exist_ok=True)
+        self.db_path = self.root / "joebro.sqlite3"
+        self.lock = threading.RLock()
+        self._init_db()
+        # Provider API keys, the IMAP/SMTP password and the bot token all live in
+        # this file in clear, so don't leave it group/world readable.
+        try:
+            os.chmod(self.root, 0o700)
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+
+    def _init_db(self):
+        with self.db() as db:
+            db.executescript(
+                """
+                create table if not exists sessions (
+                    id text primary key,
+                    name text not null,
+                    model text,
+                    endpoint_url text,
+                    endpoint_id text,
+                    mode text default 'chat',
+                    archived integer default 0,
+                    is_important integer default 0,
+                    workdir text,
+                    created_at text not null
+                );
+                create table if not exists messages (
+                    id integer primary key autoincrement,
+                    session_id text not null,
+                    role text not null,
+                    content text not null,
+                    metadata text,
+                    created_at text not null
+                );
+                create table if not exists endpoints (
+                    id text primary key,
+                    name text not null,
+                    base_url text not null,
+                    api_key text,
+                    is_enabled integer default 1,
+                    created_at text not null
+                );
+                create table if not exists prefs (
+                    key text primary key,
+                    value text
+                );
+                create table if not exists memory (
+                    id text primary key,
+                    text text not null,
+                    category text default 'general',
+                    pinned integer default 0,
+                    created_at text not null
+                );
+                create table if not exists events (
+                    id text primary key,
+                    summary text not null,
+                    dtstart text not null,
+                    dtend text not null,
+                    all_day integer default 0,
+                    location text default '',
+                    description text default '',
+                    caldav_href text default '',
+                    caldav_etag text default '',
+                    created_at text not null
+                );
+                create table if not exists uploads (
+                    id text primary key,
+                    name text not null,
+                    path text not null,
+                    mime text default '',
+                    created_at text not null
+                );
+                create table if not exists email_sources (
+                    id text primary key,
+                    type text not null,
+                    display text not null,
+                    imap_host text not null,
+                    imap_port integer not null,
+                    imap_ssl integer default 1,
+                    imap_user text not null,
+                    imap_password text default '',
+                    smtp_host text default '',
+                    smtp_port integer default 465,
+                    smtp_ssl integer default 1,
+                    smtp_user text default '',
+                    smtp_password text default '',
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists documents (
+                    id text primary key,
+                    title text not null,
+                    language text default 'markdown',
+                    current_content text default '',
+                    version_count integer default 1,
+                    file_path text,
+                    archived integer default 0,
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists tasks (
+                    id text primary key,
+                    title text not null,
+                    prompt text default '',
+                    schedule text default '',
+                    status text default 'active',
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists skills (
+                    id text primary key,
+                    name text not null,
+                    description text default '',
+                    content text default '',
+                    status text default 'draft',
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists research (
+                    id text primary key,
+                    query text not null,
+                    status text default 'queued',
+                    content text default '',
+                    archived integer default 0,
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists api_tools (
+                    id text primary key,
+                    name text not null,
+                    func_name text not null,
+                    base_url text not null,
+                    api_key text default '',
+                    method text default 'GET',
+                    description text default '',
+                    is_enabled integer default 1,
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists devices (
+                    id text primary key,
+                    name text not null,
+                    bridge_url text default '',
+                    token text default '',
+                    is_self integer default 0,
+                    created_at text not null,
+                    last_seen text default ''
+                );
+                create table if not exists mcp_servers (
+                    id text primary key,
+                    name text not null,
+                    command text not null,
+                    args text default '',
+                    enabled integer default 1,
+                    tools_json text default '[]',
+                    error text default '',
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists plugins (
+                    id text primary key,
+                    name text not null,
+                    kind text default 'foreground',
+                    repo_path text default '',
+                    description text default '',
+                    is_enabled integer default 1,
+                    source text default 'user',
+                    permission_mode text default 'sandbox',
+                    created_at text not null,
+                    updated_at text not null
+                );
+                create table if not exists agents (
+                    id text primary key,
+                    title text not null,
+                    prompt text not null,
+                    status text default 'queued',
+                    result text default '',
+                    error text default '',
+                    session_id text default '',
+                    model text default '',
+                    endpoint_id text default '',
+                    workdir text default '',
+                    permission_mode text default 'sandbox',
+                    notify integer default 1,
+                    created_at text not null,
+                    started_at text default '',
+                    finished_at text default ''
+                );
+                create table if not exists inbox (
+                    id text primary key,
+                    kind text default 'note',
+                    title text default '',
+                    body text not null,
+                    source text default '',
+                    read integer default 0,
+                    created_at text not null
+                );
+                create table if not exists plans (
+                    session_id text primary key,
+                    steps text default '[]',
+                    updated_at text not null
+                );
+                create table if not exists reminders (
+                    id text primary key,
+                    text text not null,
+                    due_at text not null,
+                    status text default 'pending',
+                    created_at text not null,
+                    fired_at text default ''
+                );
+                create table if not exists push_devices (
+                    install_id text primary key,
+                    token text not null,
+                    environment text not null,
+                    bundle_id text not null,
+                    enabled integer not null default 1,
+                    hide_previews integer not null default 1,
+                    updated_at real not null,
+                    last_success_at real,
+                    last_error text
+                );
+                create table if not exists push_activities (
+                    token text primary key,
+                    environment text not null,
+                    updated_at real not null
+                );
+                create table if not exists heartbeat_seen (
+                    source_key text not null,
+                    revision text not null,
+                    notified_at text not null,
+                    primary key (source_key, revision)
+                );
+                """
+            )
+            # plugins.permission_mode = the file-access level the plugin's tools run at.
+            try:
+                db.execute("alter table plugins add column permission_mode text default 'sandbox'")
+            except sqlite3.OperationalError:
+                pass
+            # Bundled dependency-free computer-use plugin (osascript / macOS
+            # Accessibility). Runs at full access by default.
+            _macos_use_blurb = ("Computer use through Vercel's agent-desktop: the agent reads apps as an "
+                                "accessibility tree and clicks, types and presses keys without moving your "
+                                "mouse. Install it with `npm i -g agent-desktop`; until then the built-in "
+                                "osascript version is used.")
+            db.execute("delete from plugins where id='plugin_osaurus_macos_use'")
+            db.execute(
+                "insert or ignore into plugins"
+                "(id,name,kind,repo_path,description,is_enabled,source,permission_mode,created_at,updated_at) "
+                "values('plugin_macos_use','Agent Desktop','foreground','',?,1,'bundled','full',?,?)",
+                (_macos_use_blurb, now_iso(), now_iso()),
+            )
+            # Migrate any earlier bundled row to drop the old external link + blurb.
+            db.execute("update plugins set repo_path='', name='Agent Desktop', description=? where id='plugin_macos_use'",
+                       (_macos_use_blurb,))
+
+            # Bundled Advisor plugin: the everyday model may consult a stronger
+            # one mid-task. Seeded at sandbox so it works at ANY agent access
+            # level (still configurable via the plugin's edit sheet); created_at
+            # is pinned just before macOS Use so it lists directly under it.
+            _advisor_blurb = ("Give your AI a second opinion: it can ask a more powerful model "
+                              "of your choice for advice mid-task. Pick the advisor model and "
+                              "tune when it gets called in the plugin's settings (gear).")
+            db.execute(
+                "insert or ignore into plugins"
+                "(id,name,kind,repo_path,description,is_enabled,source,permission_mode,created_at,updated_at) "
+                "select 'plugin_advisor','Advisor','foreground','',?,1,'bundled','sandbox',"
+                "datetime(created_at,'-1 second'),? from plugins where id='plugin_macos_use'",
+                (_advisor_blurb, now_iso()),
+            )
+            db.execute("delete from endpoints where lower(name) like '%fake%' or lower(name) like '%qa%' or lower(base_url) like '%fake%'")
+            db.execute("delete from prefs where key in ('default_endpoint_id', 'default_model_id') and value like '%fake%'")
+            for col in ("caldav_href", "caldav_etag"):
+                try:
+                    db.execute(f"alter table events add column {col} text default ''")
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                db.execute("alter table tasks add column scheduled_time text default ''")
+            except sqlite3.OperationalError:
+                pass
+            # folder: optional project-folder name a chat is grouped under in the
+            # sidebar (null/empty = ungrouped). Nullable, so existing DBs migrate
+            # without a crash.
+            try:
+                db.execute("alter table sessions add column folder text")
+            except sqlite3.OperationalError:
+                pass
+            # A session can be bound to a remote device's folder (the bridge):
+            # host_id '' = run tools on this host, else forward to that device.
+            try:
+                db.execute("alter table sessions add column host_id text default ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                db.execute("alter table tasks add column scheduled_date text default ''")
+            except sqlite3.OperationalError:
+                pass
+            # sort_order: user-defined sidebar order for drag-to-reorder. Backfilled
+            # from created_at so existing chats keep their newest-first order.
+            try:
+                db.execute("alter table sessions add column sort_order real")
+                db.execute("update sessions set sort_order = -julianday(created_at) where sort_order is null")
+            except sqlite3.OperationalError:
+                pass
+            # progress: JSON {phase, message} the research worker advances through
+            # ("Searching the web" -> "Reading sources" -> "Writing report" ->
+            # "Complete") so the status endpoint reports honest progress.
+            try:
+                db.execute("alter table research add column progress text default ''")
+            except sqlite3.OperationalError:
+                pass
+            for stmt in ("alter table skills add column confidence integer default 60",
+                         "alter table skills add column when_to_use text default ''",
+                         "alter table research add column images text default ''",
+                         "alter table memory add column use_count integer default 0",
+                         "alter table memory add column last_used text default ''",
+                         "alter table memory add column kind text default 'world'",
+                         "alter table memory add column topic text default ''",
+                         "alter table memory add column entities text default ''",
+                         "alter table memory add column updated_at text default ''",
+                         "alter table tasks add column last_run text default ''",
+                         "alter table tasks add column permission_mode text default 'sandbox'",
+                         "alter table tasks add column repeat_day integer default 0",
+                         "alter table tasks add column scope text default 'general'",
+                         "alter table tasks add column last_hash text default ''",
+                         "alter table sessions add column permission_mode text default 'sandbox'",
+                         "alter table mcp_servers add column permission_mode text default 'sandbox'"):
+                try:
+                    db.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
+            # The agents table is the one run registry (jb_agents): kind says
+            # research / chat / task / subagent, ref_id points at the owning row.
+            for col, decl in (("kind", "text default 'chat'"), ("ref_id", "text default ''"),
+                              ("progress", "text default ''"),
+                              ("cancel_requested", "integer default 0"),
+                              ("parent_id", "text default ''")):
+                try:
+                    db.execute(f"alter table agents add column {col} {decl}")
+                except sqlite3.OperationalError:
+                    pass
+            db.commit()
+            self._seed_default_tasks(db)
+
+    def _seed_default_tasks(self, db):
+        """Seed example tasks + skills ONCE (tracked by a pref flag, not by table
+        emptiness — so they don't reappear after you delete them, and existing
+        installs that never got them still get seeded). The skill audit is
+        enabled (it powers the self-improving loop); the rest are paused/example."""
+        now = now_iso()
+        skills = [
+            ("Daily standup",
+             "Produce a crisp daily standup update.",
+             "When I ask for a \"standup\", \"daily update\", or \"what did I do today\".",
+             "# Daily Standup\n\n"
+             "Turn what I tell you (or what's in the current chat / bound folder) into a clean standup update.\n\n"
+             "## Output format\n"
+             "Reply with exactly three short sections, one or two bullets each:\n\n"
+             "- **Yesterday / done:** what was completed\n"
+             "- **Today / next:** what I'm working on next\n"
+             "- **Blockers:** anything stuck (write \"None\" if clear)\n\n"
+             "## Rules\n"
+             "- Keep each bullet to one line.\n"
+             "- Be concrete (names, tickets, files), not vague.\n"
+             "- No preamble or sign-off — just the three sections."),
+            ("Polish my writing",
+             "Tighten and clarify text without changing meaning.",
+             "When I ask you to \"polish\", \"tighten\", \"proofread\", or \"clean up\" some writing.",
+             "# Polish My Writing\n\n"
+             "Improve a piece of text I give you (or the selected/open document) while preserving my meaning and voice.\n\n"
+             "## What to do\n"
+             "1. Fix grammar, spelling, and punctuation.\n"
+             "2. Cut filler and tighten wordy phrasing.\n"
+             "3. Improve flow and clarity; keep my tone and intent.\n"
+             "4. Preserve any Markdown structure, code, and links.\n\n"
+             "## Rules\n"
+             "- Do **not** change the meaning, add new claims, or over-formalise.\n"
+             "- Return only the revised text (no commentary) unless I ask for an explanation."),
+        ]
+        # Upgrade earlier example skills: give one-liner bodies their full
+        # procedure (only when still the short seed), and backfill when_to_use
+        # if it's empty (the column was added after the first seed). Never
+        # clobber a procedure the user has already edited.
+        for name, desc, when_to_use, procedure in skills:
+            db.execute("update skills set content=?, description=? where name=? and length(content) < 140",
+                       (procedure, desc, name))
+            db.execute("update skills set when_to_use=? where name=? and (when_to_use is null or when_to_use='')",
+                       (when_to_use, name))
+        memory_audit_prompt = (
+            "Reflect over my long-term memory with manage_memory. 1) action: list, read every entry. "
+            "2) Merge near-duplicates on a topic: edit the best with the combined text, delete the rest. "
+            "3) Rewrite vague or bloated entries as ONE self-contained fact (edit). "
+            "4) Delete experience entries that newer ones supersede, and entries with use_count 0 older than a month. "
+            "NEVER delete pinned entries. 5) Consolidate any topic with more than ~8 entries to the essentials. "
+            "Then report in one line what you merged, rewrote and removed.")
+        # One-time upgrade for existing installs (these run regardless of the
+        # seed flag): move a still-daily "Skill audit" to weekly, and insert the
+        # "Memory audit" task if it isn't already present.
+        db.execute("update tasks set schedule='weekly' where title='Skill audit' and schedule='daily'")
+        if not db.execute("select 1 from tasks where title='Memory audit'").fetchone():
+            db.execute(
+                "insert into tasks(id,title,prompt,schedule,scheduled_time,status,created_at,updated_at)"
+                " values(?,?,?,?,?,?,?,?)",
+                ("task_" + os.urandom(6).hex(), "Memory audit", memory_audit_prompt,
+                 "weekly", "07:00", "active", now, now))
+        # Existing installs keep the row but get the current reflect protocol.
+        db.execute("update tasks set prompt=? where title='Memory audit' and prompt != ?",
+                   (memory_audit_prompt, memory_audit_prompt))
+        if db.execute("select 1 from prefs where key='seeded_defaults_v1'").fetchone():
+            db.commit()
+            return   # already seeded once — only the upgrades above run for them
+        for name, desc, when_to_use, procedure in skills:
+            db.execute(
+                "insert into skills(id,name,description,content,when_to_use,status,confidence,created_at,updated_at)"
+                " values(?,?,?,?,?,?,?,?,?)",
+                ("skill_" + os.urandom(6).hex(), name, desc, procedure, when_to_use, "active", 60, now, now))
+        defaults = [
+            ("Skill audit",
+             "Review my skills using manage_skills (action: list). Delete every skill whose confidence "
+             "is below 30 using manage_skills (action: delete, id: <id>). Then briefly report what you removed.",
+             "weekly", "07:00", "active"),
+            ("Morning email summary",
+             "Summarise every email I've received since 10pm last night: group by sender, give one line each, "
+             "and call out anything that needs a reply or action.",
+             "daily", "07:00", "paused"),
+        ]
+        for title, prompt, sched, t, status in defaults:
+            db.execute(
+                "insert into tasks(id,title,prompt,schedule,scheduled_time,status,created_at,updated_at)"
+                " values(?,?,?,?,?,?,?,?)",
+                ("task_" + os.urandom(6).hex(), title, prompt, sched, t, status, now, now),
+            )
+        db.execute("insert or replace into prefs(key,value) values('seeded_defaults_v1', ?)", (json.dumps(True),))
+        db.commit()
+
+    def db(self):
+        # `with self.db() as db` must CLOSE the connection (stock sqlite3 only commits).
+        con = sqlite3.connect(self.db_path, factory=_ClosingConnection)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def rows(self, sql, args=()):
+        with self.lock, self.db() as db:
+            return [dict(r) for r in db.execute(sql, args)]
+
+    def one(self, sql, args=()):
+        with self.lock, self.db() as db:
+            row = db.execute(sql, args).fetchone()
+            return dict(row) if row else None
+
+    def exec(self, sql, args=()):
+        with self.lock, self.db() as db:
+            cur = db.execute(sql, args)
+            db.commit()
+            return cur.lastrowid
+
+__all__ = [
+    "APP_NAME",
+    "BACKEND_VERSION",
+    "PHONE_SESSION_ID",
+    "PHONE_TOOL_NAMES",
+    "PHONE_TOOL_SCHEMAS",
+    "TRANSFER_AI_TOOLS",
+    "data_dir",
+    "BUILTIN_TOOL_NAMES",
+    "BaseHTTPRequestHandler",
+    "DEFAULT_PORT",
+    "EMAIL_AI_TOOLS",
+    "ET",
+    "FUNCTION_TOOL_SCHEMAS",
+    "IMAGE_EXTS",
+    "MACOS_USE_TOOL", "ADVISOR_DEFAULT_DESC", "advisor_tool_schema",
+    "MCP_CALL_TIMEOUT",
+    "MCP_CONNECT_TIMEOUT",
+    "MCP_PATH_DIRS",
+    "MIMEMultipart",
+    "MIMEText",
+    "OBSOLETE_AI_TOOLS",
+    "PRODUCTION_AI_TOOLS",
+    "Path",
+    "Store",
+    "TOOL_ALIASES",
+    "TOOL_BLOCK_RE",
+    "ThreadingHTTPServer",
+    "WRITE_SIDE_EFFECT_TOOLS",
+    "XML_FIELD_RE",
+    "XML_INVOKE_RE",
+    "XML_PARAM_RE",
+    "XML_TOOL_RE",
+    "_MACOS_KEY_CODES",
+    "_MACOS_MODS",
+    "_MCPError",
+    "_MODELS_CACHE",
+    "_MODELS_CACHE_LOCK",
+    "_MODELS_TTL",
+    "_PATH_LOCKS",
+    "_PATH_LOCKS_GUARD",
+    "_PERMISSION_GUARD",
+    "_PERMISSION_REGISTRY",
+    "_RESEARCH_CANCEL",
+    "_RESEARCH_GUARD",
+    "_RESEARCH_STARTED",
+    "_SESSION_ALLOW",
+    "_W",
+    "_applescript_str",
+    "_fn",
+    "_mcp_kill",
+    "_mcp_session",
+    "_read_result_for_list",
+    "_xml_escape",
+    "app_support_dir",
+    "argparse",
+    "atomic_write_text", "atomic_write_bytes",
+    "backup_existing",
+    "cloak_messages", "cloak_text", "CLOAK_PATTERNS",
+    "event_time_out", "mktemp_beside", "bridge_call", "REMOTE_ROUTED_TOOLS", "LOCAL_HOST_IDS",
+    "base64",
+    "datetime",
+    "docx_extras",
+    "docx_replace_in_place",
+    "docx_to_text",
+    "docx_write_extra",
+    "docx_write_footnotes",
+    "email",
+    "hashlib",
+    "imaplib",
+    "is_docx",
+    "json",
+    "lock_for_path",
+    "macos_use_argv",
+    "mcp_call_tool",
+    "mcp_discover",
+    "mcp_env",
+    "mcp_resolve_command",
+    "mcp_split_args",
+    "mimetypes",
+    "now_iso",
+    "os",
+    "re",
+    "read_doc_text", "read_doc_context", "apply_find_replace",
+    "sanitize_tool_name",
+    "shlex",
+    "shutil",
+    "smtplib",
+    "socket",
+    "sqlite3",
+    "subprocess",
+    "tempfile",
+    "text_to_docx",
+    "textwrap",
+    "threading",
+    "time",
+    "timedelta",
+    "timezone",
+    "urllib",
+    "write_doc_text",
+    "zipfile",
+]

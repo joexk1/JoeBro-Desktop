@@ -1,0 +1,746 @@
+"""Skills, tasks, deep research, JSON serializers. (Memory lives in jb_memory.)"""
+import traceback
+
+from jb_core import *  # noqa: F401,F403
+
+_LEARN_JOBS = {}   # learn-from-sources jobs: id -> {status, detail, skills, error}
+
+
+class AssistantMixin:
+
+    def _task_endpoint(self):
+        """Pick an endpoint/model to run a scheduled task: the saved default,
+        else the most recent chat's, else any configured endpoint."""
+        ep, model = self.pref("default_endpoint_id") or "", self.pref("default_model") or ""
+        if not ep or not model:
+            # Fill the gaps independently — a saved endpoint with no saved model
+            # used to fall through as model "" and 404 at the endpoint.
+            s = self.store.one("select endpoint_id, model from sessions where endpoint_id != '' order by datetime(created_at) desc limit 1")
+            if s:
+                ep, model = ep or s.get("endpoint_id") or "", model or s.get("model") or ""
+        if not ep:
+            e = self.store.one("select id from endpoints order by datetime(created_at) limit 1")
+            ep = e["id"] if e else ""
+        return ep, model
+
+    def execute_task(self, task_id):
+        """Run a saved task through the agent loop (so it can actually use tools —
+        e.g. the skill audit calls manage_skills, the email summary reads mail).
+        Output lands in a persistent '[TASK] <name>' chat. Returns the reply."""
+        from jb_updates import task_lock
+        lock = task_lock(task_id)
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("This task is already running")
+        try:
+            return self._execute_task_locked(task_id)
+        finally:
+            lock.release()
+
+    def _execute_task_locked(self, task_id):
+        row = self.store.one("select * from tasks where id=?", (task_id,))
+        if not row:
+            return None
+        if row.get("coding_agent") and row.get("coding_repo"):      # a coding-agent task: the Night Shift runner, no model turn
+            import jb_taskagent
+            return jb_taskagent.run(self, row)
+        personal = (row.get("scope") or "general") == "personal"
+        if personal and str(self.pref("personal_automation_paused")).lower() in ("true", "1", "yes", "on"):
+            return "Phone automation is paused. Resume it in Settings > Mobile to run this task."
+        self._task_skipped = False           # read by the scheduler to decide whether the slot may be retried
+        self._task_write_performed = False
+        ep, model = self._task_endpoint()
+        tsid = "task_session_" + task_id
+        # Every task run is a registry run, so "did my task happen?" is a question
+        # with an answer, including when it failed before starting.
+        aid = self.agent_open("task", row.get("title") or "Task", session_id=tsid,
+                              model=model, endpoint_id=ep, ref_id=task_id,
+                              prompt=row.get("prompt") or "", progress="Starting")
+        if personal:
+            det = self.ptask_deterministic(row)         # page watches / extension tasks: no model
+            if det is not None:
+                self.store.exec("update tasks set last_run=?, updated_at=? where id=?", (now_iso(), now_iso(), task_id))
+                self.agent_close(aid, "done", result=det)
+                self.ptask_report(row, det)
+                return det
+            if not self.bg_budget_ok():
+                self._task_skipped = True
+                self.agent_close(aid, "failed", error="daily background LLM budget reached; scheduled retry pending")
+                return "NOTHING"
+            bep, bmodel = self.bg_model()
+            ep, model = bep or ep, bmodel or model
+            u = self.bg_usage(); u["n"] += 1; self.set_pref("bg_usage", u)
+        if not ep:
+            self.agent_close(aid, "failed", error="no model endpoint configured")
+            raise RuntimeError("No model endpoint configured — add one in Settings.")
+        if not self.store.one("select id from sessions where id=?", (tsid,)):
+            self.store.exec(
+                "insert into sessions(id,name,model,endpoint_url,endpoint_id,workdir,created_at) values(?,?,?,?,?,?,?)",
+                (tsid, "[TASK] " + (row.get("title") or "Task"), model, "", ep, "", now_iso()))
+        prompt = row.get("prompt") or row.get("title") or "Run this task."
+        if personal:        # silent background run: fresh context every time, reply is the notification
+            self.store.exec("delete from messages where session_id=?", (tsid,))
+            prompt = self.ptask_prompt(prompt)
+        self.add_message(tsid, "user", prompt, {})
+        # GUARANTEE: every task runs as an agent. This is the single chokepoint for
+        # running a task — both the manual "Run now" route and the scheduler call
+        # execute_task — and mode is hardcoded "agent" here, never read from the
+        # task row, so no task can run as plain chat. The task's own permission
+        # mode only governs file access (default: the safe sandbox).
+        pmode = (row.get("permission_mode") or "sandbox").strip() or "sandbox"
+        f = {"session": tsid, "message": prompt, "endpoint_id": ep, "model": model,
+             "permission_mode": pmode, "max_tokens": "4096", "allow_web_search": "true", "thinking": "false",
+             "_scheduled_task": True}
+        f["mode"] = "agent"   # forced last — cannot be overridden
+        if personal:
+            f["phone_tools"] = "true"     # the phone toolset (weather, reminders, agents...)
+        self._agent_run_id = aid              # so run_agent can honour a cancel
+        self.agent_started(aid)
+        self.agent_progress(aid, "Running")
+        try:
+            reply, thinking, events = self.run_agent(f)
+        except Exception as exc:
+            self.agent_close(aid, "failed", error=str(exc)[:500])
+            raise
+        finally:
+            self._agent_run_id = ""
+        meta = {"model": model}
+        if thinking:
+            meta["thinking"] = thinking
+        if events:
+            meta["tool_events"] = [{k: v for k, v in e.items() if k != "doc"} for e in events]
+        self.add_message(tsid, "assistant", reply, meta)
+        self.store.exec("update tasks set last_run=?, updated_at=? where id=?", (now_iso(), now_iso(), task_id))
+        self._task_visualizations = [e["visualization"] for e in events if e.get("visualization")]
+        if (row.get("schedule") or "").lower() == "once":
+            self.store.exec("update tasks set status='done' where id=?", (task_id,))
+        if self.agent_run_cancelled(aid):
+            self.agent_close(aid, "cancelled", result=(reply or "").strip(),
+                             error="stopped on request; partial output kept")
+        else:
+            self.agent_close(aid, "done", result=(reply or "").strip())
+            if personal:
+                try:
+                    self.ptask_report(row, reply)
+                except Exception:
+                    traceback.print_exc()
+        return reply
+
+    def _active_background_plugins(self):
+        """Enabled background (guardrail) plugins applied to every turn."""
+        rows = self.store.rows("select * from plugins where kind='background' and is_enabled=1 "
+                               "and coalesce(source,'')<>'manifest' order by name")
+        try:
+            rows += self.plugin_guardrails()   # joebro.plugin/1 guardrail contributions
+        except Exception:
+            pass
+        return rows
+
+    # Words too generic to make a skill "relevant" on their own — they show up in
+    # lots of skill descriptions and used to drag UI/design skills into plain chat.
+    _SKILL_STOPWORDS = frozenset({
+        "this", "that", "with", "have", "your", "from", "they", "will", "make",
+        "makes", "help", "want", "need", "just", "like", "about", "into", "what",
+        "when", "where", "there", "their", "then", "than", "some", "more", "most",
+        "also", "been", "being", "does", "done", "could", "would", "should",
+        "please", "thanks", "thank", "hello", "give", "gives", "using", "used",
+        "over", "very", "much", "many", "good", "well", "here", "know", "look",
+        "tell", "show", "find", "take", "them", "time", "work", "stuff", "thing",
+    })
+
+    def _use_relevant_skills(self, message, f=None):
+        """Find saved skills relevant to this request, inject them, and RAISE the
+        confidence of the ones ACTUALLY chosen (the self-improving loop). Two
+        stages: (1) a cheap whole-word keyword filter over the curated fields
+        (name/description/when-to-use) builds a small CANDIDATE set — when nothing
+        overlaps we stop here with zero cost and inject nothing; (2) a fast-model
+        gate then confirms which candidates truly apply before anything is
+        injected, so marginal keyword overlap no longer pollutes the context."""
+        rows = self.store.rows("select * from skills where status != 'archived'")
+        if not rows:
+            return "", []
+        words = {w for w in re.findall(r"[a-z0-9]+", (message or "").lower())
+                 if len(w) > 3 and w not in self._SKILL_STOPWORDS}
+        if not words:
+            return "", []
+        # Per-skill curated word sets, plus document frequency across the library:
+        # a word in many skills (design, image, project) is weak signal; one in
+        # just a couple is distinctive enough to match on its own.
+        sig = {}
+        df = {}
+        for r in rows:
+            nw = set(re.findall(r"[a-z0-9]+", (r.get("name") or "").lower()))
+            sw = nw | set(re.findall(
+                r"[a-z0-9]+",
+                ((r.get("description") or "") + " " + (r.get("when_to_use") or "")).lower()))
+            sig[r["id"]] = (nw, sw)
+            for w in sw:
+                df[w] = df.get(w, 0) + 1
+        scored = []
+        for r in rows:
+            name_words, signal_words = sig[r["id"]]
+            hits = words & signal_words
+            if not hits:
+                continue
+            name_hit = bool(words & name_words)
+            # A distinctive word = rare in the library AND a substantial token, so
+            # a common short verb that's merely rare here (write, reply) doesn't
+            # count, but a real noun (discord, tiktok, exhibition) does.
+            rare_hit = any(df.get(w, 0) <= 2 and len(w) >= 6 for w in hits)
+            # Qualify on real signal: 2+ matching words, a hit on the skill's own
+            # name, or a single DISTINCTIVE word. A lone generic word still won't.
+            if len(hits) >= 2 or name_hit or rare_hit:
+                rank = len(hits) + (2 if name_hit else 0) + (1 if rare_hit else 0)
+                scored.append((rank, len(hits), r))
+        if not scored:
+            return "", []
+        scored.sort(key=lambda t: t[0], reverse=True)
+        candidates = [r for _, _, r in scored[:6]]      # recall set (cap for the gate)
+        cand_hits = {r["id"]: nh for _, nh, r in scored[:6]}
+
+        # PRECISION GATE — a fast model confirms which candidates DIRECTLY apply.
+        # Only reached because the keyword filter already found plausible matches,
+        # so most turns never pay for it. None = call failed → conservative
+        # fallback to the single top keyword match (not the old top-3 dump).
+        f = f or {}
+        endpoint_id = f.get("endpoint_id") or f.get("endpoint") or ""
+        model = f.get("model") or ""
+        matched = self._skill_router(message, candidates, endpoint_id, model) if (endpoint_id and model) else None
+        if matched is None:
+            matched = candidates[:1]
+        matched = matched[:3]
+        if not matched:
+            return "", []
+        for r in matched:
+            # Confidence climbs HARSH and incremental, and ONLY for skills the gate
+            # actually chose — so keyword-matched-but-rejected skills don't inflate
+            # and survive the audit. Based on distinct matching words (real efficacy).
+            nhits = cand_hits.get(r["id"], 1)
+            bump = min(8, 2 + nhits)
+            new_conf = min(100, (r.get("confidence") if r.get("confidence") is not None else 60) + bump)
+            self.store.exec("update skills set confidence=?, updated_at=? where id=?", (new_conf, now_iso(), r["id"]))
+        # 300 chars used to cut the average skill's procedure in half — the gate
+        # above already decided this skill applies, so sending a procedure the
+        # model can't finish reading is the worst of both. At most 3 skills reach
+        # here, so the ceiling is ~3.6k chars and only on turns that earned it.
+        lines = "\n".join(f"- {r.get('name')}: {(r.get('content') or '').strip()[:1200]}" for r in matched)
+        return ("Relevant saved skills you can apply to this request:\n" + lines,
+                [r.get("name") for r in matched if r.get("name")])
+
+    def _skill_router(self, message, candidates, endpoint_id, model):
+        """Ask a fast model which CANDIDATE skills directly apply to the request.
+        Returns the chosen subset (possibly empty), or None if the call fails so
+        the caller can fall back. Keeps the prompt tiny: numbered triggers only."""
+        catalog = "\n".join(
+            f"{i + 1}. {r.get('name')}: {(r.get('when_to_use') or r.get('description') or '').strip()[:160]}"
+            for i, r in enumerate(candidates))
+        try:
+            out = self._complete(
+                endpoint_id, model,
+                "You gate which saved skills apply to a user request. MOST requests need NONE. "
+                "A skill applies ONLY if the request is exactly the kind of task its trigger describes. "
+                "Reply with ONLY a JSON array of the numbers that clearly apply — [] when in doubt.",
+                f"Skills:\n{catalog}\n\nUser request: {message}", max_tokens=40)
+        except Exception:
+            return None
+        if not out:
+            return None
+        m = re.search(r"\[[\d,\s]*\]", out)
+        if not m:
+            return [] if "[]" in out else None
+        try:
+            nums = json.loads(m.group(0))
+        except Exception:
+            return None
+        chosen = []
+        for n in nums:
+            if isinstance(n, int) and 1 <= n <= len(candidates) and candidates[n - 1] not in chosen:
+                chosen.append(candidates[n - 1])
+        return chosen
+
+    def _auto_learn(self, sid, user_msg, reply, endpoint_id, model):
+        """After a turn, quietly extract a durable user memory and/or a reusable
+        skill and save them. Auto-skills start at low confidence so they must
+        prove useful (get used) or get pruned by the skill audit. Best-effort."""
+        if not endpoint_id or len((user_msg or "").strip()) < 25:
+            return
+        try:
+            topics = ", ".join(self.memory_topics()) or "(none yet)"
+            out = self._complete(
+                endpoint_id, model,
+                "Extract durable learnings from one chat turn. Reply with ONLY JSON: "
+                '{"memories": [up to 3 of {"kind": "world"|"experience"|"opinion", "topic": <kebab-case page name>, '
+                '"text": <ONE self-contained fact, under 200 chars>, "entities": [names]}], '
+                '"skill": {"name": <imperative title>, "description": <one line>, "when_to_use": <the trigger>, '
+                '"content": <3-6 numbered steps>} or null}. '
+                "world = a lasting fact about the user's world; experience = what happened or the state of an ongoing project; "
+                "opinion = a preference or judgement the user expressed. "
+                f"Reuse an existing topic page when one fits: {topics}. "
+                "Never store one-off chatter, secrets, or what the assistant said; an empty memories list is normal. "
+                "skill = a repeatable workflow written so it can be followed WITHOUT this conversation (real description, trigger, "
+                "concrete steps); null if nothing qualifies or any field would be vague.",
+                f"User: {user_msg}\n\nAssistant: {(reply or '')[:1500]}", max_tokens=900)
+            if not out:
+                return
+            m = re.search(r"\{.*\}", out, re.DOTALL)
+            data = json.loads(m.group(0)) if m else {}
+            mems = data.get("memories")
+            if not isinstance(mems, list):   # older extractor shape: {"memory": <str>}
+                legacy = data.get("memory")
+                mems = [{"text": legacy}] if isinstance(legacy, str) else []
+            for item in mems[:3]:
+                if isinstance(item, dict) and str(item.get("text") or "").strip().lower() not in ("", "null", "none"):
+                    self.retain_memory(item)   # merges near-dups on the topic page
+            sk = data.get("skill")
+            if isinstance(sk, dict) and (sk.get("name") or "").strip():
+                content = sk.get("content") or sk.get("procedure") or ""
+                if isinstance(content, list):   # model sometimes returns steps as an array
+                    content = "\n".join(f"{i+1}. {s}" for i, s in enumerate(content))
+                content = str(content).strip()
+                # Skip thin junk: an auto-skill must carry a usable procedure.
+                if len(content) >= 25:
+                    names = [(e.get("name") or "").lower() for e in self.store.rows("select name from skills")]
+                    if (sk.get("name") or "").strip().lower() not in names:
+                        self.store.exec(
+                            "insert into skills(id,name,description,content,when_to_use,status,confidence,created_at,updated_at)"
+                            " values(?,?,?,?,?,?,?,?,?)",
+                            ("skill_" + os.urandom(6).hex(), sk.get("name").strip(),
+                             (sk.get("description") or "").strip(), content,
+                             (sk.get("when_to_use") or "").strip(), "draft", 20, now_iso(), now_iso()))
+        except Exception:
+            pass
+
+    def upsert_task(self, body, task_id=None):
+        tid = task_id or body.get("id") or body.get("task_id") or "task_" + os.urandom(6).hex()
+        now = now_iso()
+        existing = self.store.one("select * from tasks where id=?", (tid,))
+        title = body.get("title") or body.get("name") or (existing or {}).get("title") or "Untitled task"
+        prompt = body.get("prompt") or body.get("description") or (existing or {}).get("prompt") or ""
+        schedule = body.get("schedule") or body.get("rrule") or (existing or {}).get("schedule") or ""
+        scheduled_time = body.get("time") or body.get("scheduled_time") or (existing or {}).get("scheduled_time") or ""
+        status = body.get("status") or (existing or {}).get("status") or "active"
+        pmode = (body.get("permission_mode") or (existing or {}).get("permission_mode") or "sandbox").strip() or "sandbox"
+        if pmode not in ("sandbox", "readonly", "full"):
+            pmode = "sandbox"
+        # repeat_day: weekday a weekly task fires on (0=Mon ... 6=Sun). Default Mon.
+        # Accept "weekday" too (the agent tool exposes it under that clearer name).
+        rday = body.get("repeat_day")
+        if rday is None:
+            rday = body.get("weekday")
+        if rday is None:
+            rday = (existing or {}).get("repeat_day", 0) if existing else 0
+        try:
+            rday = max(0, min(6, int(rday or 0)))
+        except (TypeError, ValueError):
+            rday = 0
+        import jb_taskagent
+        coding = jb_taskagent.parse(body, existing)
+        scheduled_date = body.get("date") or body.get("scheduled_date") or (existing or {}).get("scheduled_date") or ""
+        if schedule and schedule not in ("once", "daily", "weekly", "monthly"):
+            raise ValueError("schedule must be once, daily, weekly or monthly")
+        if scheduled_time and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", scheduled_time):
+            raise ValueError("time must be HH:MM in local time")
+        if schedule == "once":
+            try: datetime.strptime(scheduled_date, "%Y-%m-%d")
+            except ValueError: raise ValueError("one-shot tasks need date=YYYY-MM-DD")
+        # scope is fixed at creation: personal tasks get a ptask_ id and never change sides.
+        scope = (existing or {}).get("scope") or ("personal" if str(body.get("scope") or "").lower() == "personal" else "general")
+        if not existing and scope == "personal" and not str(tid).startswith("ptask_"):
+            tid = "ptask_" + os.urandom(6).hex()
+        if existing:
+            self.store.exec(
+                "update tasks set title=?,prompt=?,schedule=?,scheduled_time=?,status=?,permission_mode=?,repeat_day=?,updated_at=? where id=?",
+                (title, prompt, schedule, scheduled_time, status, pmode, rday, now, tid),
+            )
+        else:
+            self.store.exec(
+                "insert into tasks(id,title,prompt,schedule,scheduled_time,status,permission_mode,repeat_day,scope,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+                (tid, title, prompt, schedule, scheduled_time, status, pmode, rday, scope, now, now),
+            )
+        self.store.exec("UPDATE tasks SET scheduled_date=? WHERE id=?", (scheduled_date, tid))
+        jb_taskagent.save(self, tid, coding)
+        return {"ok": True, "task": self.task_json(self.store.one("select * from tasks where id=?", (tid,)))}
+
+    def upsert_skill(self, body, skill_id=None):
+        sid = skill_id or body.get("id") or body.get("skill_id") or "skill_" + os.urandom(6).hex()
+        now = now_iso()
+        existing = self.store.one("select * from skills where id=?", (sid,))
+        name = body.get("name") or body.get("title") or (existing or {}).get("name") or "Untitled skill"
+        description = body.get("description") or (existing or {}).get("description") or ""
+        content = body.get("procedure") or body.get("content") or body.get("text") or (existing or {}).get("content") or ""
+        if isinstance(content, (list, dict)):
+            content = json.dumps(content, ensure_ascii=False, indent=2)
+        when_to_use = body.get("when_to_use") or (existing or {}).get("when_to_use") or ""
+        status = body.get("status") or (existing or {}).get("status") or "draft"
+        # Manually-created skills start established (60); auto-created ones pass
+        # a low confidence so they must prove useful (via use) or get audited out.
+        conf = body.get("confidence")
+        conf = int(conf) if conf is not None else ((existing or {}).get("confidence") if existing else 60)
+        if conf is None:
+            conf = 60
+        if existing:
+            self.store.exec(
+                "update skills set name=?,description=?,content=?,when_to_use=?,status=?,confidence=?,updated_at=? where id=?",
+                (name, description, content, when_to_use, status, conf, now, sid),
+            )
+        else:
+            self.store.exec(
+                "insert into skills(id,name,description,content,when_to_use,status,confidence,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                (sid, name, description, content, when_to_use, status, conf, now, now),
+            )
+        return {"ok": True, "skill": self.skill_json(self.store.one("select * from skills where id=?", (sid,)))}
+
+
+    # ---- learn skills from a folder of sources -------------------------------
+
+    _SOURCE_EXTS = (".md", ".txt", ".pdf", ".docx", ".doc", ".csv", ".xlsx",
+                    ".apkg", ".html", ".htm", ".json", ".tex", ".py", ".ipynb")
+
+    _LEARN_SKILL_SYSTEM = (
+        "You are studying a folder of source material to teach yourself a reusable skill. "
+        "Work out what craft the sources embody — the exercise types and how they are solved, the "
+        "analysis methods, the document structures and templates, the notation and conventions — and "
+        "write the skill(s) that would let you produce the same kind of work from scratch WITHOUT the "
+        "sources. Respond with ONLY a JSON array: "
+        '[{"name": <short imperative title>, "description": <one line>, '
+        '"when_to_use": <what kind of request should invoke this>, '
+        '"content": <the complete method as 5-12 numbered markdown steps, with the key formulas, '
+        "patterns, worked micro-examples and templates inline>}]. "
+        "Prefer ONE thorough skill; use up to 3 only when the folder contains genuinely distinct crafts.")
+
+    def learn_skills_start(self, path, device=""):
+        """Kick off a background learn-from-sources job; poll learn_skills_status."""
+        if not (path or "").strip():
+            raise ValueError("pass the folder to learn from")
+        job = "learn_" + os.urandom(5).hex()
+        _LEARN_JOBS[job] = {"status": "running", "detail": "Reading the sources…", "skills": []}
+        threading.Thread(target=self._learn_skills_job, args=(job, path, device), daemon=True).start()
+        return job
+
+    def learn_skills_status(self, job):
+        return _LEARN_JOBS.get(job or "", {"status": "error", "error": "unknown job"})
+
+    def _learn_skills_job(self, job, path, device):
+        st = _LEARN_JOBS[job]
+        try:
+            docs = self._gather_sources(path, device)
+            if not docs:
+                raise ValueError("no readable documents in that folder")
+            ep, model = self._task_endpoint()
+            if not ep or not model:
+                raise ValueError("no default model configured — pick one in Settings")
+            st["detail"] = f"Studying {len(docs)} documents with {model}…"
+            corpus = "\n\n".join(f"=== {n} ===\n{t[:8000]}" for n, t in docs)[:60000]
+            out = self._complete(ep, model, self._LEARN_SKILL_SYSTEM, corpus, max_tokens=3000)
+            m = re.search(r"\[.*\]", out or "", re.DOTALL)
+            made = []
+            for sk in (json.loads(m.group(0)) if m else [])[:3]:
+                if isinstance(sk, dict) and (sk.get("name") or "").strip() and len(str(sk.get("content") or "")) >= 40:
+                    self.upsert_skill(sk)
+                    made.append(sk["name"].strip())
+            if not made:
+                raise ValueError("the model produced no usable skill — try a folder with more substantive material")
+            st.update(status="done", detail="", skills=made)
+        except Exception as exc:
+            st.update(status="error", error=str(exc))
+
+    def _gather_sources(self, path, device=""):
+        """(filename, text) for every readable document in the folder, one
+        sublevel deep. ponytail: 24 files / 8k chars each is plenty to learn a
+        craft from; image-only scans need OCR we don't do."""
+        if device:
+            bridge = self._device_bridge(device)
+            if not bridge:
+                raise ValueError(f"device '{device}' has no bridge configured")
+            return self._gather_sources_bridged(bridge, device, path)
+        import time as _time
+        root = Path(path).expanduser()
+        if not root.is_dir():
+            raise ValueError(f"not a folder: {path}")
+        docs = []
+        deadline = _time.time() + 120   # a folder of huge scans must not stall the job
+        for p in sorted(root.rglob("*")):
+            if len(docs) >= 24 or _time.time() > deadline:
+                break
+            if not p.is_file() or p.name.startswith(".") or len(p.relative_to(root).parts) > 2:
+                continue
+            if p.suffix.lower() not in self._SOURCE_EXTS:
+                continue
+            try:
+                if p.stat().st_size > 8_000_000:
+                    continue   # scanned/image-heavy — no text worth the extraction cost
+                text = self.read_pdf_text(p) if p.suffix.lower() == ".pdf" else read_doc_text(p)
+            except Exception:
+                continue
+            if (text or "").strip():
+                docs.append((p.name, text.strip()))
+        return docs
+
+    def create_research(self, query, endpoint_id=None, model=None):
+        endpoint_id = endpoint_id or self.pref("default_endpoint_id") or ""
+        model = model or self.pref("default_model") or ""
+        rid = "research_" + os.urandom(6).hex()
+        now = now_iso()
+        progress = json.dumps({"phase": "Queued", "message": query})
+        self.store.exec(
+            "insert into research(id,query,status,content,progress,archived,created_at,updated_at) values(?,?,?,?,?,?,?,?)",
+            (rid, query, "running", f"# {query}\n\nResearching…", progress, 0, now, now),
+        )
+        # Register in the one agent registry so a client sees research beside
+        # chat agents and tasks instead of having to poll a third API.
+        self.agent_open("research", query, ref_id=rid, model=model or "",
+                        endpoint_id=endpoint_id or "", progress="Queued", notify=0)
+        self.start_research_worker(rid, query, endpoint_id, model)
+        return rid
+
+    def start_research_worker(self, rid, query, endpoint_id, model):
+        """Spawn the worker for `rid` exactly once. A panel reload / repeat POST
+        never starts a second worker, and a finished/cancelled item is never
+        re-run (the worker itself bails on a non-running status)."""
+        with _RESEARCH_GUARD:
+            if rid in _RESEARCH_STARTED:
+                return
+            _RESEARCH_STARTED.add(rid)
+            _RESEARCH_CANCEL.discard(rid)
+        threading.Thread(target=self._run_research, args=(rid, query, endpoint_id, model), daemon=True).start()
+
+    def cancel_research(self, rid):
+        """Mark a research item cancelled. The worker checks the flag between
+        phases and stops; the row's status becomes 'cancelled' so it never
+        re-runs or claims to be running."""
+        row = self.store.one("select status from research where id=?", (rid,))
+        if not row:
+            return self.json({"ok": False, "detail": "not found"}, 404)
+        with _RESEARCH_GUARD:
+            _RESEARCH_CANCEL.add(rid)
+        self.store.exec(
+            "update research set status='cancelled', progress=?, updated_at=? where id=?",
+            (json.dumps({"phase": "Cancelled", "message": ""}), now_iso(), rid))
+        self._close_research_run(rid, "cancelled")
+        return self.json({"ok": True, "status": "cancelled"})
+
+    def _close_research_run(self, rid, status, error=""):
+        aid = self._research_run_id(rid)
+        if aid:
+            self.agent_close(aid, status, error=error)   # result is read from research.content
+
+    def _research_cancelled(self, rid):
+        with _RESEARCH_GUARD:
+            if rid in _RESEARCH_CANCEL:
+                return True
+        row = self.store.one("select status from research where id=?", (rid,))
+        return bool(row) and row.get("status") == "cancelled"
+
+    @staticmethod
+    def _report_with_images(content, images):
+        """Place up to 2 images inline: one right under the # title, a second
+        under the 2nd ## section. Returns content unchanged if no images."""
+        images = [u for u in (images or []) if u][:2]
+        if not images:
+            return content
+        out, placed_top, h2 = [], False, 0
+        for line in content.split("\n"):
+            out.append(line)
+            if not placed_top and line.startswith("# "):
+                out += ["", f"![]({images[0]})"]
+                placed_top = True
+            elif len(images) > 1 and line.startswith("## "):
+                h2 += 1
+                if h2 == 2:
+                    out += ["", f"![]({images[1]})"]
+        if not placed_top:   # no top-level heading — prepend
+            out = [f"![]({images[0]})", ""] + out
+        return "\n".join(out)
+
+    def _research_run_id(self, rid):
+        row = self.store.one("select id from agents where kind='research' and ref_id=?", (rid,))
+        return (row or {}).get("id") or ""
+
+    def _set_research_progress(self, rid, phase, message=""):
+        self.store.exec("update research set progress=?, updated_at=? where id=?",
+                        (json.dumps({"phase": phase, "message": message}), now_iso(), rid))
+        aid = self._research_run_id(rid)
+        if aid:
+            if not self.store.one("select started_at from agents where id=? and started_at!=''", (aid,)):
+                self.agent_started(aid)
+            self.agent_progress(aid, phase + ((": " + message) if message else ""))
+
+    def _run_research(self, rid, query, endpoint_id, model):
+        try:
+            if self._research_cancelled(rid):
+                self._close_research_run(rid, "cancelled")
+                return
+            self._set_research_progress(rid, "Searching the web", query)
+            results = self.search_web(query, count=12)
+            # Long, sentence-shaped prompts can return nothing from a search
+            # engine even when the topic has plenty of material. Retry with a
+            # concise query before allowing the model to write a report.
+            if not results and len(query.split()) > 8:
+                short_query = " ".join(query.split()[:8])
+                results = self.search_web(short_query, count=12)
+            if not results:
+                raise RuntimeError("No web sources were found. Try a narrower topic or check web search.")
+            if self._research_cancelled(rid):
+                self._close_research_run(rid, "cancelled")
+                return
+            self._set_research_progress(rid, "Reading sources", f"{len(results)} sources")
+            images = self.search_images(query, count=2)   # best-effort, rendered inline (not in the .md)
+            if images:
+                self.store.exec("update research set images=? where id=?", (json.dumps(images), rid))
+            sources_md = "\n".join(
+                f"- [{r['title']}]({r['url']})" + (f"\n  {r['snippet']}" if r.get("snippet") else "")
+                for r in results
+            ) or "- No sources found."
+            report = None
+            if endpoint_id and not self._research_cancelled(rid):
+                self._set_research_progress(rid, "Writing report", query)
+                src_text = "\n\n".join(
+                    f"[{i}] {r['title']}\n{r['url']}\n{r.get('snippet', '')}"
+                    for i, r in enumerate(results, 1)
+                ) or "(no sources retrieved)"
+                report = self._complete(
+                    endpoint_id, model,
+                    "You are a meticulous senior research analyst writing an in-depth briefing for an "
+                    "expert reader. Produce a LONG, comprehensive, well-structured Markdown report — aim "
+                    "for substantial depth, not a summary. Required structure:\n"
+                    "1. A top-level title (single # heading) restating the topic.\n"
+                    "2. An '## Executive Summary' of 1-2 dense paragraphs covering the key findings.\n"
+                    "3. At least FOUR to SIX themed analysis sections, each a '## heading', that go deep: "
+                    "explain mechanisms, compare viewpoints, cite concrete specifics (names, numbers, dates, "
+                    "examples). Reference sources inline by bracket number (e.g. [3]) for specific facts.\n"
+                    "4. A '## Caveats & Limitations' section.\n"
+                    "5. A '## Conclusion' with a clear bottom line.\n"
+                    "STYLE: make it SCANNABLE, not a wall of text. Lead each section with one short framing "
+                    "sentence, then use BULLET POINTS (and '### subheadings') for the substance — most of the "
+                    "detail should be bullets, with bold lead-ins where useful. Keep paragraphs to 1-3 sentences. "
+                    "Be thorough in coverage but tight in prose. Use ONLY the supplied sources; never fabricate.",
+                    f"Research topic: {query}\n\nNumbered web sources:\n{src_text}\n\n"
+                    "Write the complete, in-depth, bullet-driven report now.",
+                    max_tokens=8000,
+                )
+            if self._research_cancelled(rid):
+                self._close_research_run(rid, "cancelled")
+                return
+            content = (report.strip() + "\n\n## Sources\n" + sources_md) if report else (
+                f"# {query}\n\n## Sources\n{sources_md}")
+            self.store.exec("update research set status='completed', content=?, progress=?, updated_at=? where id=?",
+                            (content, json.dumps({"phase": "Complete", "message": ""}), now_iso(), rid))
+            self._close_research_run(rid, "done")
+        except Exception as exc:
+            if self._research_cancelled(rid):
+                self._close_research_run(rid, "cancelled")
+                return
+            self.store.exec("update research set status='failed', content=?, progress=?, updated_at=? where id=?",
+                            (f"# {query}\n\nResearch failed: {exc}",
+                             json.dumps({"phase": "Complete", "message": "failed"}), now_iso(), rid))
+            self._close_research_run(rid, "failed", error=str(exc)[:500])
+        finally:
+            with _RESEARCH_GUARD:
+                _RESEARCH_STARTED.discard(rid)
+                _RESEARCH_CANCEL.discard(rid)
+
+    @staticmethod
+    def loads(s):
+        if not s:
+            return {}
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def session_json(r):
+        return {
+            "id": r["id"],
+            "name": r["name"],
+            "model": r.get("model") or "",
+            "mode": r.get("mode") or "chat",
+            "archived": bool(r.get("archived")),
+            "is_important": bool(r.get("is_important")),
+            "host_id": r.get("host_id") or "",
+            "workdir": r.get("workdir") or "",
+            "folder": r.get("folder") or None,
+            "sort_order": r.get("sort_order"),
+            "created_at": r.get("created_at"),
+        }
+
+    @staticmethod
+    def event_json(r):
+        return {
+            "uid": r["id"],
+            "id": r["id"],
+            "summary": r["summary"],
+            "dtstart": event_time_out(r["dtstart"], r["all_day"]),
+            "dtend": event_time_out(r["dtend"], r["all_day"]),
+            "all_day": bool(r["all_day"]),
+            # The raw stored values, for anything that needs the instant verbatim.
+            "dtstart_utc": r["dtstart"],
+            "dtend_utc": r["dtend"],
+            "location": r["location"],
+            "description": r["description"],
+        }
+
+    @staticmethod
+    def task_json(r):
+        title = r.get("title") or "Untitled task"
+        return {
+            "id": r["id"],
+            "name": title,
+            "title": title,
+            "prompt": r.get("prompt") or "",
+            "schedule": r.get("schedule") or "",
+            "scheduled_time": r.get("scheduled_time") or "",
+            "scheduled_date": r.get("scheduled_date") or "",
+            "status": r.get("status") or "active",
+            "permission_mode": r.get("permission_mode") or "sandbox",
+            "repeat_day": int(r.get("repeat_day") or 0),
+            "scope": r.get("scope") or "general",
+            "last_run": r.get("last_run") or "",
+            "coding_agent": r.get("coding_agent") or "",
+            "coding_repo": r.get("coding_repo") or "",
+            "coding_host": r.get("coding_host") or "",
+            "coding_model": r.get("coding_model") or "",
+            "coding_status": r.get("coding_status") or "",
+            "coding_night_id": r.get("coding_night_id") or "",
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        }
+
+    @staticmethod
+    def skill_json(r):
+        return {
+            "id": r["id"],
+            "name": r.get("name") or "Untitled skill",
+            "description": r.get("description") or "",
+            "content": r.get("content") or "",
+            "procedure": r.get("content") or "",          # the editor's "Procedure (markdown)"
+            "when_to_use": r.get("when_to_use") or "",
+            "category": r.get("category") or "general",
+            "status": r.get("status") or "draft",
+            "confidence": r.get("confidence") if r.get("confidence") is not None else 60,
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        }
+
+    @classmethod
+    def research_json(cls, r):
+        # Older reports stored their bibliography only in the Markdown body.
+        # Expose it as structured data too, as the macOS and iOS readers expect.
+        content = r.get("content") or ""
+        bibliography = re.split(r"(?m)^## Sources\s*$", content, maxsplit=1)
+        sources = []
+        if len(bibliography) == 2:
+            for match in re.finditer(r"(?m)^- \[([^\]]+)\]\((https?://[^)]+)\)(?:\n  ([^\n]+))?", bibliography[1]):
+                sources.append({"title": match.group(1), "url": match.group(2),
+                                "snippet": match.group(3) or ""})
+        return {
+            "id": r["id"],
+            "query": r.get("query") or "",
+            "status": r.get("status") or "queued",
+            "content": content,
+            "sources": sources,
+            "source_count": len(sources),
+            "progress": cls.loads(r.get("progress")) or {},
+            "archived": bool(r.get("archived")),
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        }
