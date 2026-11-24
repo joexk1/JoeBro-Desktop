@@ -1,15 +1,16 @@
+<p align="center">
+  <img src="README_assets/logo.png" alt="JoeBro Desktop" width="120">
+</p>
+
 <h1 align="center">JoeBro Desktop</h1>
 
 <p align="center">The local-first workspace for your agents, on Windows and Linux. Your files, your models, your machine.</p>
 
-<p align="center">
-  <a href="https://github.com/joexk1/JoeBro-Desktop/stargazers"><img src="https://img.shields.io/github/stars/joexk1/JoeBro-Desktop?style=flat&logo=github&label=stars" alt="GitHub stars"></a>
-  <a href="https://github.com/joexk1/JoeBro-Desktop/releases"><img src="https://img.shields.io/github/downloads/joexk1/JoeBro-Desktop/total?style=flat&label=downloads" alt="Downloads"></a>
-  <a href="https://github.com/joexk1/JoeBro-Desktop/releases/latest"><img src="https://img.shields.io/github/v/release/joexk1/JoeBro-Desktop?style=flat&label=release" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey?style=flat" alt="Platform: Windows and Linux">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/joexk1/JoeBro-Desktop?style=flat" alt="License: GPLv3"></a>
-  <a href="https://github.com/joexk1/JoeBro-Desktop/commits/main"><img src="https://img.shields.io/github/last-commit/joexk1/JoeBro-Desktop/main?style=flat&label=last%20commit" alt="Last commit"></a>
-</p>
+<p align="center"><a href="https://joebro.pages.dev/"><b>joebro.pages.dev</b></a></p>
+
+**Sister repos:** the Mac app is **[JoeBro](https://github.com/joexk1/JoeBro)** and the iPhone app is **[JoeBro Mobile](https://github.com/joexk1/JoeBro-Mobile)**. JoeBro Desktop runs on its own; it can also connect to the backend of a JoeBro Mac app.
+
+---
 
 ![JoeBro Desktop on Windows, with a Codex session asking for approval, and the light theme on Linux](assets/readme/hero.png)
 
