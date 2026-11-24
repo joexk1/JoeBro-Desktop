@@ -17,4 +17,14 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         zi.compress_type = zipfile.ZIP_DEFLATED
         zi.external_attr = 0o644 << 16
         z.writestr(zi, f.read_bytes())
+    # tzdata (pure-Python IANA zone database): Windows Python ships without one, so
+    # zoneinfo.ZoneInfo("UTC") fails there unless this is importable. Vendored wheel.
+    for whl in sorted((here / "vendor").glob("tzdata-*.whl")):
+        with zipfile.ZipFile(whl) as w:
+            for n in sorted(w.namelist()):
+                if n.startswith("tzdata/") and not n.endswith("/"):
+                    zi = zipfile.ZipInfo(n, (2026, 1, 1, 0, 0, 0))
+                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    zi.external_attr = 0o644 << 16
+                    z.writestr(zi, w.read(n))
 print(f"wrote {out} ({out.stat().st_size // 1024} KiB)")
