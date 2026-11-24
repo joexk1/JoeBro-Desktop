@@ -486,6 +486,8 @@ impl JoeBro {
                 .show(ctx, |ui| {
                     let r = ui.max_rect();
                     widgets::panel_glass(ctx, &pal, r, pal.panel_fill);
+                    // Never let editor content paint outside the pane.
+                    ui.set_clip_rect(r.intersect(ui.clip_rect()));
                     self.editor.ui(ui, &mut self.sh);
                 });
         }
@@ -776,6 +778,13 @@ impl JoeBro {
         });
         self.sh.active_doc = Some("demo-outline".into());
         self.sh.editor_visible = true;
+        // SNAP_DOC=<file> renders that markdown in preview (layout regression checks).
+        if let Some(text) = std::env::var("SNAP_DOC").ok().and_then(|p| std::fs::read_to_string(p).ok()) {
+            if let Some(d) = self.sh.open_docs.last_mut() {
+                d.content = text;
+            }
+            self.editor.preview = true;
+        }
     }
 }
 

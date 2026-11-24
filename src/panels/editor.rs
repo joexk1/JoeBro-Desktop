@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct EditorPanel {
-    preview: bool,
+    pub(crate) preview: bool,
     // flashcard study session: queue of card indices + revealed state
     study_queue: Vec<usize>,
     study_revealed: bool,
@@ -367,17 +367,26 @@ impl EditorPanel {
             if is_html {
                 self.html_preview(ui, sh, idx);
             } else {
-                let mut area = ScrollArea::vertical().id_salt(("editor-preview", &doc_id)).auto_shrink([false, false]);
+                // Both axes: an unwrappable block (wide table, long code line) scrolls sideways
+                // inside the pane instead of widening it past its clip.
+                let mut area = ScrollArea::both().id_salt(("editor-preview", &doc_id)).auto_shrink([false, false]);
                 if let Some(f) = self.preview_to.take() {
                     area = area.vertical_scroll_offset((f * self.preview_range).max(0.0));
                 }
                 let out = area.show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.set_max_width(720.0 + 48.0);
-                        egui::Frame::none().inner_margin(egui::Margin::symmetric(24.0, 20.0)).show(ui, |ui| {
-                            ui.set_max_width(720.0);
+                    // A fixed reading column (720 max), centred by explicit left padding so a
+                    // wide child can only grow to the right, never off the left edge.
+                    let avail = ui.available_width();
+                    let col = (avail - 48.0).clamp(120.0, 720.0);
+                    let pad = ((avail - col) / 2.0).max(16.0);
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(pad);
+                        ui.vertical(|ui| {
+                            ui.set_width(col);
+                            ui.add_space(20.0);
                             crate::panels::mdview::prose_style(ui, &sh.palette, true);
                             CommonMarkViewer::new().show(ui, &mut self.md, &crate::widgets::preprocess_md(&content));
+                            ui.add_space(20.0);
                         });
                     });
                 });

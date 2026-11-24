@@ -260,6 +260,7 @@ pub fn footer(ui: &mut Ui, p: &Palette, lang: &str, stats: &str, suggested: usiz
     hairline(ui, p, ui.cursor().top(), 12.0);
     ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_space(12.0);
         let m = |s: &str| theme::ty::mono(s, 10.5, W::Regular).color(p.ink3);
         if !lang.is_empty() {
             ui.label(m(lang));
@@ -275,6 +276,7 @@ pub fn footer(ui: &mut Ui, p: &Palette, lang: &str, stats: &str, suggested: usiz
             ui.label(theme::ty::mono(format!("{suggested} suggested"), 10.5, W::Regular).color(p.accent));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(12.0);
             if dirty {
                 crate::ascii::spinner(ui, 10.0, p.ink3);
             } else {
